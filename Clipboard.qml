@@ -24,6 +24,15 @@ Item {
   property int pinnedCount: 0
 
   property string historyPath: Quickshell.env("HOME") + "/.local/state/omarchy/clipboard-history.json"
+  readonly property string imageDir: Quickshell.env("HOME") + "/.local/state/omarchy/clipboard-images/"
+
+  // Only files capture.sh wrote (content-addressed, inside the image store)
+  // are ever handed to tesseract or magick; a crafted history file cannot
+  // point them at arbitrary paths, options, or ImageMagick coder prefixes.
+  function isStoredImage(path) {
+    path = String(path || "")
+    return path.indexOf(root.imageDir) === 0 && /^[0-9a-f]{64}\.[a-z]+$/.test(path.slice(root.imageDir.length))
+  }
   property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, "")
   property string captureScript: root.pluginDir + "/capture.sh"
 
@@ -356,10 +365,13 @@ Item {
     Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-clipboard-open", "--history-index", String(row.historyIndex)])
   }
 
+  // The text goes to wl-copy over stdin, never argv: process command lines
+  // are readable by every local account, and OCR text can be private.
   function copyPlain(text) {
     if (!text) return
     root.opened = false
-    Quickshell.execDetached(["sh", "-c", 'printf %s "$1" | wl-copy', "clipboard-copy", String(text)])
+    copyProc.payload = String(text)
+    if (!copyProc.running) copyProc.running = true
   }
 
   // Display rows are capped for rendering; copies always read the history.
@@ -413,11 +425,23 @@ Item {
 
   // ------------------------------------------------------------ OCR
 
+  // OCR waits for the dims probe: tesseract treats a file it cannot decode as
+  // a list of image paths and reads those instead, so a fake "image" offered
+  // on the clipboard could make it OCR any readable picture on disk. Only
+  // files ImageMagick identified as a real image of a known format are used.
   function maybeStartOcr() {
     if (!root.opened || !root.ocrAvailable || ocrProc.running) return
     var row = root.currentRow
-    if (!row || row.entryType !== "image") return
+    if (!row || row.entryType !== "image" || !root.isStoredImage(row.path)) return
     if (row.ocrDone || root.ocrFailed.indexOf(row.path) !== -1) return
+    if (!root.imageDims[row.path]) return
+    // Leptonica holds the decoded bitmap uncompressed; a tiny PNG can expand
+    // to gigabytes, so very large images are skipped rather than read.
+    var wh = root.imageDims[row.path].split("×")
+    if (Number(wh[0]) * Number(wh[1]) > root.ocrMaxPixels) {
+      root.ocrFailed = root.ocrFailed.concat([row.path])
+      return
+    }
     root.ocrPath = row.path
     ocrProc.running = true
   }
@@ -425,6 +449,7 @@ Item {
   // A failed or timed-out run is not persisted (it would never retry), only
   // remembered for this session so it does not loop.
   property var ocrFailed: []
+  readonly property int ocrMaxPixels: 40000000  // 8K (7680×4320) is 33 MP
 
   function finishOcr(path, text, exitCode) {
     if (exitCode === 0) {
@@ -449,11 +474,14 @@ Item {
     ? String(root.imageDims[root.currentRow.path] || "") : ""
 
   property bool dimsAvailable: false
+  // The formats capture.sh stores; anything else identify reports is not a picture.
+  readonly property var imageFormats: ["PNG", "JPEG", "WEBP", "GIF", "BMP", "TIFF"]
 
   function maybeProbeDims() {
     if (!root.opened || !root.dimsAvailable || dimsProc.running) return
     var row = root.currentRow
     if (!row || row.entryType !== "image" || root.imageDims[row.path] !== undefined) return
+    if (!root.isStoredImage(row.path)) return
     dimsProc.path = row.path
     dimsProc.running = true
   }
@@ -462,9 +490,11 @@ Item {
     var dims = {}
     for (var key in root.imageDims) dims[key] = root.imageDims[key]
     var parts = String(text || "").trim().split(/\s+/)
-    dims[path] = code === 0 && parts.length === 2 && Number(parts[0]) > 0 ? parts[0] + "×" + parts[1] : ""
+    var realImage = code === 0 && parts.length === 3 && root.imageFormats.indexOf(parts[0]) !== -1 && Number(parts[1]) > 0
+    dims[path] = realImage ? parts[1] + "×" + parts[2] : ""
     root.imageDims = dims
     Qt.callLater(root.maybeProbeDims)
+    Qt.callLater(root.maybeStartOcr)
   }
 
   onCurrentRowChanged: { Qt.callLater(root.maybeStartOcr); Qt.callLater(root.maybeProbeDims) }
@@ -523,7 +553,8 @@ Item {
 
   Process {
     id: ocrProc
-    command: ["timeout", "20s", "tesseract", root.ocrPath, "stdout"]
+    // Hard caps on time and address space; a failed run is just "no text".
+    command: ["prlimit", "--as=2000000000", "timeout", "20s", "tesseract", root.ocrPath, "stdout"]
     stdout: StdioCollector {
       id: ocrOut
       waitForEnd: true
@@ -535,12 +566,29 @@ Item {
     id: dimsProc
     property string path: ""
     // "[0]" selects the first frame; animated GIFs otherwise print one record per frame.
-    command: ["magick", "identify", "-ping", "-format", "%w %h", path + "[0]"]
+    command: ["magick", "identify", "-ping", "-format", "%m %w %h", path + "[0]"]
     stdout: StdioCollector {
       id: dimsOut
       waitForEnd: true
     }
     onExited: function(code) { root.finishDims(dimsProc.path, dimsOut.text, code) }
+  }
+
+  Process {
+    id: copyProc
+    property string payload: ""
+    command: ["wl-copy"]
+    stdinEnabled: true
+    onStarted: {
+      write(payload)
+      payload = ""
+      stdinEnabled = false  // closes stdin after the buffered write is flushed
+    }
+    // A copy requested while the previous one was still starting runs next.
+    onExited: {
+      stdinEnabled = true
+      if (payload !== "") running = true
+    }
   }
 
   Process {

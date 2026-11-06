@@ -22,7 +22,7 @@ A native [Omarchy](https://omarchy.org/) clipboard manager that extends the buil
 Install and enable the plugin:
 
 ```bash
-omarchy plugin add https://github.com/Akshad135/real-clipboard.git --enable
+omarchy plugin add https://github.com/Akshad135/clipnest.git --enable
 omarchy restart shell
 ```
 
@@ -45,7 +45,7 @@ omarchy-shell shell toggle omarchy.clipboard
 | `←` `→` | switch category |
 | `Enter` | copy and paste into the focused window |
 | `Shift+Enter` | copy only |
-| `Ctrl+O` / `Alt+Enter` | open: links in the browser, images in the viewer, text in the editor |
+| `Ctrl+O` / `Alt+Enter` | open: images in the viewer, text that contains a URL in the browser, other text in the editor |
 | `Ctrl+Shift+P` | copy the file path (images and files) |
 | `Ctrl+Shift+C` | copy as plain text; for images, the OCR text |
 | `Tab` | pin / unpin |
@@ -84,7 +84,7 @@ Disabling restores the built-in clipboard. History is kept; only the pins are fo
 - `omarchy` / `quickshell` (shell framework)
 - `wl-clipboard` (`wl-paste` watcher and `wl-copy`)
 - `jq`, `wtype` (used by Omarchy's own paste scripts)
-- `imagemagick` (`magick identify`, image dimensions in the preview; chip is absent without it)
+- `imagemagick` (`magick identify`, verifies each image and reads its dimensions; OCR only runs on images it accepts, so without it there is no dimensions chip and no OCR)
 - `tesseract` with a language pack, optional (`omarchy pkg add tesseract tesseract-data-eng`); without it images simply have no text panel
 
 Everything except `tesseract` is part of Omarchy's base install. No sudo or pkexec is required.
@@ -94,9 +94,9 @@ Everything except `tesseract` is part of Omarchy's base install. No sudo or pkex
 ## Architecture & Security
 
 - **Network:** None. The plugin never makes a network request. Opening a link hands the URL to Omarchy's browser launcher, and only on an explicit keypress or click.
-- **Execution:** All child processes use structured argument arrays via Quickshell `Process`, no shell string interpolation. The one `sh -c` helper (copying a value to the clipboard) has a fixed script and receives the value positionally as `$1`.
+- **Execution:** All child processes use structured argument arrays via Quickshell `Process`, no shell string interpolation. Clipboard text is written to `wl-copy` over stdin, never passed as a process argument, so it does not show up in process listings visible to other local accounts.
 - **Capture Boundary:** Capture uses Omarchy's own `capture.sh`, unchanged: every read of the clipboard owner is bounded by a timeout, password-manager clips (`x-kde-passwordManagerHint`) are skipped, and images are stored content-addressed by SHA-256.
-- **Image Handling:** Previews and thumbnails are decoded at roughly their drawn size, never at the file's own size. Dimensions are read from the file header only (`identify -ping`). OCR runs with a 20-second deadline; a failed run is not persisted.
+- **Image Handling:** Previews and thumbnails keep only a bitmap of roughly their drawn size, never the file's own size. `tesseract` and `magick` are only ever given files inside Omarchy's content-addressed image store, and OCR runs only after `identify -ping` (header only) confirms the file is a real PNG, JPEG, WebP, GIF, BMP, or TIFF, because tesseract treats undecodable input as a list of image paths to read. OCR skips images over 40 megapixels and runs under a 20-second deadline and a 2 GB address-space limit (`prlimit`), since the decoded bitmap can be far larger than the file; a failed run is not persisted.
 - **Privilege Boundary:** Runs entirely as an unprivileged user process. The two clipboard watchers are tied to the shell's lifetime with `pdeathsig`; nothing is installed or left running outside the shell.
 - **State Storage:** History lives in `~/.local/state/omarchy/clipboard-history.json`, the same file the built-in uses, with image blobs under `~/.local/state/omarchy/clipboard-images/`. Clipnest adds two optional fields per entry, `pinned` and `ocr`; Omarchy's scripts ignore both.
 
