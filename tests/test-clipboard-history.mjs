@@ -91,6 +91,15 @@ test("displayRows filters by category; all and unknown match everything", () => 
   assert.deepEqual(names("files"), ["file"])
 })
 
+test("displayRows finds pins past the unpinned limit", () => {
+  const h = []
+  for (let i = 0; i < 60; i++) h.push(text("u" + i))
+  h.push(text("late pin", { pinned: true }))
+  const rows = H.displayRows(h, "", 50)
+  assert.equal(rows[0].previewText, "late pin")
+  assert.equal(rows.length, 51)
+})
+
 test("displayRows limit counts unpinned rows only", () => {
   const h = [text("p1", { pinned: true }), text("a"), text("b"), text("c")]
   const rows = H.displayRows(h, "", 2)

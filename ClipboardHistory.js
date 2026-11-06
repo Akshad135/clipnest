@@ -39,6 +39,14 @@ function entryKey(entry) {
   return "text:" + String(entry.text || "")
 }
 
+function indexOfKey(history, key) {
+  var values = Array.isArray(history) ? history : []
+  for (var i = 0; i < values.length; i++) {
+    if (entryKey(normalizeEntry(values[i])) === key) return i
+  }
+  return -1
+}
+
 function parseHistory(raw) {
   try {
     var parsed = JSON.parse(String(raw || "[]"))
@@ -325,17 +333,20 @@ function displayRows(history, query, limit, tr, trn, fmt, category) {
   var pinned = []
   var recent = []
 
-  for (var i = 0; i < values.length && recent.length < max; i++) {
+  // Scan everything: the limit applies to unpinned rows only, and a pin can
+  // sit anywhere in the history.
+  for (var i = 0; i < values.length; i++) {
     var entry = cappedEntry(normalizeEntry(values[i]))
     if (!entry) continue
+    var isPin = isPinned(entry)
+    if (!isPin && recent.length >= max) continue
     if (needle && searchableText(entry).toLowerCase().indexOf(needle) < 0) continue
     if (wanted && categoryOf(entry) !== wanted) continue
 
     var paths = filePaths(entry)
     var isFile = paths.length > 0
     var isImage = entry.type === "image"
-    var isPin = isPinned(entry)
-    var category = categoryOf(entry)
+    var entryCategory = categoryOf(entry)
     var previewPath = isImage ? String(entry.path || "") : (isFile && paths.length === 1 && isImagePath(paths[0]) ? paths[0] : "")
     var row = {
       entryType: isFile ? "file" : entry.type,
@@ -346,7 +357,7 @@ function displayRows(history, query, limit, tr, trn, fmt, category) {
       mime: isImage ? String(entry.mime || "image/png") : "text/plain",
       pinned: isPin,
       section: isPin ? "pinned" : "recent",
-      category: category,
+      category: entryCategory,
       capturedAt: isImage ? String(entry.capturedAt || "") : "",
       ocr: isImage ? (typeof entry.ocr === "string" ? entry.ocr : null) : null,
       truncated: !!entry.truncated,
@@ -363,6 +374,7 @@ if (typeof module !== "undefined") {
   module.exports = {
     normalizeEntry: normalizeEntry,
     entryKey: entryKey,
+    indexOfKey: indexOfKey,
     parseHistory: parseHistory,
     addEntry: addEntry,
     removeEntryAt: removeEntryAt,

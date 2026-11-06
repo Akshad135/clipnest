@@ -111,7 +111,7 @@ Item {
   // One confirm box for the destructive actions: "clear" (Shift+Del),
   // "deletePinned" (Ctrl+Del on a pin), "unpinAll" (Shift+Tab).
   property string confirmAction: ""
-  property int confirmHistoryIndex: -1
+  property string confirmKey: ""
 
   function confirmMessage() {
     var t = Commons.I18n.t
@@ -126,9 +126,9 @@ Item {
     return t("common.delete")
   }
 
-  function requestConfirm(action, historyIndex) {
+  function requestConfirm(action, key) {
     root.confirmAction = action
-    root.confirmHistoryIndex = historyIndex === undefined ? -1 : historyIndex
+    root.confirmKey = key || ""
     clearConfirm.selectedIndex = 1
     root.clearConfirmOpen = true
   }
@@ -141,7 +141,8 @@ Item {
   function requestDeletePinned(index) {
     var row = root.rowAt(index)
     if (!row || !row.pinned) return
-    root.requestConfirm("deletePinned", row.historyIndex)
+    // Remember the entry, not its index: a copy can land while the box is up.
+    root.requestConfirm("deletePinned", ClipboardHistory.entryKey(root.history[row.historyIndex]))
   }
 
   function requestUnpinAll() {
@@ -159,7 +160,9 @@ Item {
   function confirmClearHistory() {
     var keepIndex = -1
     if (root.confirmAction === "deletePinned") {
-      root.history = ClipboardHistory.removeEntryAt(root.history, root.confirmHistoryIndex, true)
+      var at = ClipboardHistory.indexOfKey(root.history, root.confirmKey)
+      if (at >= 0 && ClipboardHistory.isPinned(root.history[at]))
+        root.history = ClipboardHistory.removeEntryAt(root.history, at, true)
       root.selectedIndex = Math.max(0, root.selectedIndex - 1)
     } else if (root.confirmAction === "unpinAll") {
       // Keep the cursor on the same entry after it moves out of the pin section.
@@ -241,7 +244,9 @@ Item {
         pinned: row.pinned,
         section: row.section,
         capturedAt: row.capturedAt,
-        ocr: row.ocr,
+        // ListModel cannot hold null, so "not read yet" is its own role.
+        ocrDone: row.ocr !== null && row.ocr !== undefined,
+        ocr: row.ocr || "",
         truncated: row.truncated,
         historyIndex: row.index
       })
@@ -367,7 +372,8 @@ Item {
   function copyTextOf(row) {
     if (!row) return
     if (row.entryType === "image") root.copyPlain(String(row.ocr || ""))
-    else root.copyPlain(row.fullText)
+    else if (row.entryType === "file") root.copyPlain(row.fullText)
+    else root.copySelected(row) // full text from history, not the display cap
   }
 
   function hasPath(row) {
@@ -405,14 +411,22 @@ Item {
     if (!root.opened || !root.ocrAvailable || ocrProc.running) return
     var row = root.currentRow
     if (!row || row.entryType !== "image") return
-    if (row.ocr !== null && row.ocr !== undefined) return
+    if (row.ocrDone || root.ocrFailed.indexOf(row.path) !== -1) return
     root.ocrPath = row.path
     ocrProc.running = true
   }
 
-  function finishOcr(path, text) {
-    root.history = ClipboardHistory.setOcrForPath(root.history, path, String(text || "").trim())
-    root.saveHistory()
+  // A failed or timed-out run is not persisted (it would never retry), only
+  // remembered for this session so it does not loop.
+  property var ocrFailed: []
+
+  function finishOcr(path, text, exitCode) {
+    if (exitCode === 0) {
+      root.history = ClipboardHistory.setOcrForPath(root.history, path, String(text || "").trim())
+      root.saveHistory()
+    } else {
+      root.ocrFailed = root.ocrFailed.concat([path])
+    }
     root.ocrPath = ""
     if (root.opened) {
       var keep = root.selectedIndex
@@ -447,9 +461,13 @@ Item {
 
   // Reap watchers left behind by a previous shell instance (ours or the
   // built-in's), then start our own. pdeathsig ties them to the shell.
+  function regexEscape(text) {
+    return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  }
+
   Process {
     id: initProc
-    command: ["pkill", "-f", "wl-paste .*--watch .*/clipboard/capture\\.sh"]
+    command: ["pkill", "-f", "wl-paste .*--watch (" + root.regexEscape(root.captureScript) + "|.*/shell/plugins/clipboard/capture\\.sh)"]
     onExited: {
       currentProc.running = true
       textWatchProc.running = true
@@ -468,9 +486,10 @@ Item {
     id: ocrProc
     command: ["timeout", "20s", "tesseract", root.ocrPath, "stdout"]
     stdout: StdioCollector {
+      id: ocrOut
       waitForEnd: true
-      onStreamFinished: root.finishOcr(root.ocrPath, text)
     }
+    onExited: function(code) { root.finishOcr(root.ocrPath, ocrOut.text, code) }
   }
 
   Process {
@@ -994,7 +1013,7 @@ Item {
               PreviewPane {
                 anchors.fill: parent
                 row: root.currentRow
-                ocrBusy: ocrProc.running && root.currentRow && root.ocrPath === root.currentRow.path
+                ocrBusy: !!(ocrProc.running && root.currentRow && root.ocrPath === root.currentRow.path)
                 ocrAvailable: root.ocrAvailable
                 foreground: root.foreground
                 lineColor: root.lineColor
