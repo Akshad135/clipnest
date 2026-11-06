@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "akshad.clipboard",
+  "name": "Clipboard",
+  "version": "0.1.0",
+  "author": "akshad",
+  "description": "Omarchy's clipboard manager with pins, categories, and a key hint footer",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Clipboard.qml"
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.clipboard"
+  }
+}
