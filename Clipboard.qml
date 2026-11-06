@@ -7,7 +7,7 @@ import qs.Commons as Commons
 import qs.Ui
 import "ClipboardHistory.js" as ClipboardHistory
 
-// akshad135.clipboard: a clone of omarchy.clipboard. Same history file, capture flow and paste
+// Clipnest (akshad135.clipnest): a clone of omarchy.clipboard. Same history file, capture flow and paste
 // scripts; adds pins, category tabs, a per-type preview pane with lazy OCR,
 // and a key-hint footer. One box style, one chip style, one pin glyph.
 Item {
@@ -443,8 +443,10 @@ Item {
   readonly property string currentImageDims: root.currentRow && root.currentRow.entryType === "image"
     ? String(root.imageDims[root.currentRow.path] || "") : ""
 
+  property bool dimsAvailable: false
+
   function maybeProbeDims() {
-    if (!root.opened || dimsProc.running) return
+    if (!root.opened || !root.dimsAvailable || dimsProc.running) return
     var row = root.currentRow
     if (!row || row.entryType !== "image" || root.imageDims[row.path] !== undefined) return
     dimsProc.path = row.path
@@ -497,13 +499,21 @@ Item {
       textWatchProc.running = true
       imageWatchProc.running = true
       ocrCheckProc.running = true
+      dimsCheckProc.running = true
     }
   }
 
+  // Optional helpers are probed once; a missing one just disables its feature.
   Process {
     id: ocrCheckProc
     command: ["sh", "-c", "command -v tesseract >/dev/null"]
     onExited: function(code) { root.ocrAvailable = code === 0 }
+  }
+
+  Process {
+    id: dimsCheckProc
+    command: ["sh", "-c", "command -v magick >/dev/null"]
+    onExited: function(code) { root.dimsAvailable = code === 0 }
   }
 
   Process {

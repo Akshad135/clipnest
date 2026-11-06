@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "id": "akshad135.clipboard",
-  "name": "Clipboard",
+  "id": "akshad135.clipnest",
+  "name": "Clipnest",
   "version": "1.0.0",
   "author": "akshad135",
   "description": "Omarchy's clipboard manager, extended: pins, category tabs, per-type previews with OCR, and a key-hint footer",
