@@ -475,7 +475,7 @@ Item {
 
   property bool dimsAvailable: false
   // The formats capture.sh stores; anything else identify reports is not a picture.
-  readonly property var imageFormats: ["PNG", "JPEG", "WEBP", "GIF", "BMP", "TIFF"]
+  readonly property var imageFormats: ["PNG", "JPEG", "WEBP", "GIF", "BMP", "BMP2", "BMP3", "TIFF"]
   // Coder forced from the extension capture.sh chose; without the prefix
   // ImageMagick sniffs magic bytes and would hand PS/PDF/SVG bytes in a
   // ".png" to ghostscript or librsvg before the format check ever runs.
