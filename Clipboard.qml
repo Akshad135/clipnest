@@ -362,19 +362,24 @@ Item {
     Quickshell.execDetached(["sh", "-c", 'printf %s "$1" | wl-copy', "clipboard-copy", String(text)])
   }
 
+  // Display rows are capped for rendering; copies always read the history.
+  function filePathsOf(row) {
+    return ClipboardHistory.fullText(root.history[row.historyIndex])
+  }
+
   // Ctrl+Shift+P: the file path behind an image or file entry.
   function copyPathOf(row) {
     if (!row) return
     if (row.entryType === "image") root.copyPlain(row.path)
-    else if (row.entryType === "file") root.copyPlain(row.fullText)
+    else if (row.entryType === "file") root.copyPlain(root.filePathsOf(row))
   }
 
   // Ctrl+Shift+C: the entry as plain text — OCR text for images.
   function copyTextOf(row) {
     if (!row) return
     if (row.entryType === "image") root.copyPlain(String(row.ocr || ""))
-    else if (row.entryType === "file") root.copyPlain(row.fullText)
-    else root.copySelected(row) // full text from history, not the display cap
+    else if (row.entryType === "file") root.copyPlain(root.filePathsOf(row))
+    else root.copySelected(row)
   }
 
   function hasPath(row) {
@@ -529,7 +534,8 @@ Item {
   Process {
     id: dimsProc
     property string path: ""
-    command: ["magick", "identify", "-ping", "-format", "%w %h", path]
+    // "[0]" selects the first frame; animated GIFs otherwise print one record per frame.
+    command: ["magick", "identify", "-ping", "-format", "%w %h", path + "[0]"]
     stdout: StdioCollector {
       id: dimsOut
       waitForEnd: true
@@ -679,10 +685,10 @@ Item {
           } else if (event.key === Qt.Key_Right) {
             root.cycleCategory(1)
             event.accepted = true
-          } else if (event.key === Qt.Key_Up || (ctrl && event.key === Qt.Key_P)) {
+          } else if (event.key === Qt.Key_Up || (ctrl && !shift && event.key === Qt.Key_P)) {
             root.select(-1)
             event.accepted = true
-          } else if (event.key === Qt.Key_Down || (ctrl && event.key === Qt.Key_N)) {
+          } else if (event.key === Qt.Key_Down || (ctrl && !shift && event.key === Qt.Key_N)) {
             root.select(1)
             event.accepted = true
           } else if (event.key === Qt.Key_PageUp) {

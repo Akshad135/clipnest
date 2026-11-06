@@ -71,7 +71,7 @@ Item {
       if (row.capturedAt) out.push(String(row.capturedAt))
       if (hasOcr) out.push(Commons.I18n.t("clipboard.chipOcr", "%1 words of text").replace("%1", ClipboardHistory.textStats(ocrText).words))
     } else if (isFile) {
-      out.push(plural("clipboard.files", filePathList.length, "%1 file", "%1 files"))
+      out.push(plural("clipboard.files", filePathList.length, "%1 file", "%1 files") + (row.truncated ? "+" : ""))
     } else if (isLink) {
       var domain = ClipboardHistory.urlDomain(fullText)
       if (domain) out.push(domain)
