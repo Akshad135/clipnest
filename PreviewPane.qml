@@ -1,913 +1,354 @@
 import QtQuick
-import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
-import "Classify.js" as Classify
+import "ClipboardHistory.js" as ClipboardHistory
 
-// Right-hand preview pane for the clipboard picker.
-// Renders a full preview plus metadata chips, per derived type.
-// `result` is a Fuzzy search result: { row: {entry, content, app, type, ...}, positions }
+// Per-type preview for the selected row: a header with the type and metadata
+// chips, then the content (framed image, wrapped text, link, or file list),
+// then OCR text for images once it has been read.
 Item {
   id: root
 
-  property var result: null
-  property var entry: result ? result.row.entry : null
-  property string derived: result ? result.row.type : ""
-  // Wired by the picker: opens the current result (browser for links).
-  property var openAction: function() {}
-  // Wired by the picker: copies a string (OCR text, QR payload) to the clipboard.
-  property var copyTextAction: function(text) {}
-  property string pluginDir: ""
-  property int fileIndex: 0
-  readonly property var filePaths: entry && entry.type === "files" ? entry.paths || [] : []
-  readonly property string selectedFile: filePaths.length ? filePaths[Math.min(fileIndex, filePaths.length - 1)] : ""
-  property var fileInfo: ({})
-  property int fileRequest: 0
-  onFilePathsChanged: fileIndex = 0
-  onSelectedFileChanged: {
-    fileRequest++
-    fileInfo = ({})
-    fileProbe.running = false
-    fileDelay.restart()
+  // Row from the picker's display model, or null.
+  property var row: null
+  property bool ocrBusy: false
+  property bool ocrAvailable: true
+
+  property color foreground: "white"
+  property color lineColor: "gray"
+  property color chipBg: "gray"
+  property color selectedText: "white"
+  property string fontFamily: ""
+  property int cornerRadius: 0
+  property int pad: 12
+
+  signal openLink()
+  signal copyText(string text)
+
+  readonly property string entryType: row ? String(row.entryType) : ""
+  readonly property string category: row ? String(row.category) : ""
+  readonly property string fullText: row ? String(row.fullText) : ""
+  readonly property string imageUrl: row ? String(row.previewImage) : ""
+  readonly property bool isImage: entryType === "image"
+  readonly property bool isFile: entryType === "file"
+  readonly property bool isLink: category === "links"
+  readonly property var filePathList: isFile ? fullText.split("\n") : []
+  readonly property string ocrText: row && row.ocr !== null && row.ocr !== undefined ? String(row.ocr) : ""
+  readonly property bool hasOcr: isImage && ocrText.trim().length > 0
+
+  function typeIcon() {
+    if (isImage) return "󰋩"
+    if (isFile) return "󰈔"
+    if (isLink) return "󰌷"
+    return "󰈙"
   }
-  Timer {
-    id: fileDelay
-    interval: 120
-    onTriggered: {
-      if (!root.selectedFile || !root.pluginDir) return
-      fileProbe.command = ["python3", root.pluginDir + "/scripts/file-preview.py", String(root.fileRequest), root.selectedFile]
-      fileProbe.running = true
+
+  function typeLabel() {
+    if (isImage) return Commons.I18n.t("clipboard.typeImage", "Image")
+    if (isFile) return filePathList.length === 1
+      ? Commons.I18n.t("clipboard.typeFile", "File")
+      : Commons.I18n.t("clipboard.typeFiles", "Files")
+    if (isLink) return Commons.I18n.t("clipboard.typeLink", "Link")
+    return Commons.I18n.t("clipboard.typeText", "Text")
+  }
+
+  // Catalog plural when the key exists, English otherwise.
+  function plural(key, count, one, other) {
+    var value = Commons.I18n.tn(key, count, "")
+    if (typeof value !== "string" || !value) value = count === 1 ? one : other
+    return value.replace("%1", Commons.I18n.formatNumber(count))
+  }
+
+  function chips() {
+    if (!row) return []
+    var out = []
+    if (isImage) {
+      if (image.status === Image.Ready && image.sourceSize.width > 0)
+        out.push(image.sourceSize.width + "×" + image.sourceSize.height)
+      out.push(String(row.mime || "").replace(/^image\//, ""))
+      if (row.capturedAt) out.push(String(row.capturedAt))
+      if (hasOcr) out.push(Commons.I18n.t("clipboard.chipOcr", "%1 words of text").replace("%1", ClipboardHistory.textStats(ocrText).words))
+    } else if (isFile) {
+      out.push(plural("clipboard.files", filePathList.length, "%1 file", "%1 files"))
+    } else if (isLink) {
+      var domain = ClipboardHistory.urlDomain(fullText)
+      if (domain) out.push(domain)
+    } else {
+      var stats = ClipboardHistory.textStats(fullText)
+      out.push(plural("clipboard.chars", stats.chars, "%1 char", "%1 chars") + (row.truncated ? "+" : ""))
+      out.push(plural("clipboard.lines", stats.lines, "%1 line", "%1 lines"))
+      out.push(plural("clipboard.words", stats.words, "%1 word", "%1 words"))
     }
-  }
-  Process {
-    id: fileProbe
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        try {
-          var data = JSON.parse(text)
-          if (String(data.request) === String(root.fileRequest)) root.fileInfo = data.file
-        } catch (e) {}
-      }
-    }
-  }
-  function fileDetails() {
-    var f = fileInfo
-    var parts = []
-    if (f.kind) parts.push(f.kind)
-    if (f.bytes !== undefined && f.kind !== "Folder") parts.push(Classify.formatBytes(f.bytes))
-    if (f.width && f.height) parts.push(f.width + "×" + f.height)
-    if (f.duration) {
-      var seconds = Math.floor(f.duration)
-      parts.push(Math.floor(seconds / 60) + ":" + (seconds % 60 < 10 ? "0" : "") + seconds % 60)
-    }
-    if (f.audio) parts.push(f.audio)
-    if (f.modified) parts.push("Modified " + new Date(f.modified * 1000).toLocaleString())
-    return parts.join(" · ")
+    if (row.pinned) out.push("󰐃 " + Commons.I18n.t("clipboard.chipPinned", "pinned"))
+    return out
   }
 
+  // One chip look for the whole plugin: muted pill, caption text.
+  component Chip: Rectangle {
+    property string label: ""
+    property bool clickable: false
+    signal clicked()
 
-  readonly property string font_: Style.font.menuFamily
-  readonly property color fg: Color.menu.text
-  readonly property color mutedFg: Util.alpha(fg, 0.55)
-  readonly property color chipBg: Util.alpha(fg, 0.07)
-  readonly property color lineColor: Util.alpha(fg, 0.16)
-
-  // Textual types render in the scrollable body; every other type has its
-  // own block below. Derived as bindings (not set from onResultChanged) so
-  // the body text and the type can never disagree mid-update, which used to
-  // leave a stale text body visible underneath an image preview.
-  readonly property bool textual: derived === "text" || derived === "code"
-                                  || derived === "email" || derived === "number"
-                                  || derived === "json" || derived === "html"
-  readonly property string bodyText: {
-    if (!entry || !textual) return ""
-    var raw = String(entry.text || "")
-    if (derived === "json") return Classify.prettyJson(raw, 200000) || raw
-    if (derived === "html") return Classify.stripHtml(raw) || raw
-    return raw
-  }
-
-  function rawSafe() {
-    return entry ? String(entry.text || "").trim() : ""
-  }
-
-  function rgbLine() {
-    var rgb = Classify.colorToRgb(rawSafe())
-    return rgb ? "rgb(" + rgb[0] + ", " + rgb[1] + ", " + rgb[2] + ")" : ""
-  }
-
-  function hslLine() {
-    var hsl = Classify.colorToHsl(rawSafe())
-    return hsl ? "hsl(" + hsl[0] + ", " + hsl[1] + "%, " + hsl[2] + "%)" : ""
-  }
-
-  // URL inside the decoded QR payload ("" when the payload is not a link).
-  function qrUrl() {
-    if (!entry || !entry.qr) return ""
-    var url = Classify.extractUrl(entry.qr)
-    if (url) return url
-    var trimmed = String(entry.qr).trim()
-    return root.bareDomainRe.test(trimmed) ? trimmed : ""
-  }
-
-  readonly property var bareDomainRe: /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:\/[^\s]*)?$/i
-
-  function metaChips() {
-    if (!result) return []
-    var r = result.row
-    var e = r.entry
-    var chips = []
-    if (r.app) chips.push(Classify.prettyApp(r.app))
-    if (e.qr) chips.push("QR: " + Classify.firstLine(e.qr, 40))
-    if (e.ocr) {
-      var ow = Classify.textStats(e.ocr).words
-      chips.push("OCR: " + Classify.plural(ow, "word"))
-    }
-    if (e.type === "text" && e.text) {
-      var st = Classify.textStats(e.text)
-      chips.push(Classify.plural(st.words, "word"))
-      chips.push(Classify.plural(st.lines, "line"))
-    }
-    if (r.bytes > 0 && e.type !== "files") chips.push(Classify.formatBytes(r.bytes))
-    if (e.type === "image" && e.w && e.h) chips.push(e.w + "×" + e.h)
-    if (e.type === "image") chips.push(e.mime || "image")
-    if (e.pinned) chips.push("★ pinned")
-    if (r.uses > 0) chips.push("pasted " + r.uses + "×")
-    return chips
-  }
-
-  // ------------------------------------------------------------- header
-
-  Row {
-    id: headerRow
-    anchors.top: parent.top
-    anchors.left: parent.left
-    anchors.right: parent.right
-    spacing: Style.space(10)
-
-    Rectangle {
-      width: Style.space(38)
-      height: width
-      radius: Style.cornerRadius
-      color: root.chipBg
-      anchors.verticalCenter: parent.verticalCenter
-
-      Text {
-        anchors.centerIn: parent
-        text: Classify.typeIcon(root.derived)
-        color: root.fg
-        font.family: root.font_
-        font.pixelSize: Style.font.heading
-      }
-    }
-
-    Column {
-      width: parent.width - Style.space(48) - badge.width - Style.space(10)
-      anchors.verticalCenter: parent.verticalCenter
-      spacing: Style.space(2)
-
-      Text {
-        width: parent.width
-        text: {
-          if (!root.entry) return ""
-          var e = root.entry
-          if (e.type === "image") return e.qr ? Classify.firstLine(e.qr, 120) : Classify.fileBase(e.path)
-          if (e.type === "files") {
-            var base = Classify.fileBase(e.paths[0])
-            return e.paths.length > 1 ? base + "  +" + (e.paths.length - 1) + " more" : base
-          }
-          return Classify.firstLine(e.text, 200)
-        }
-        color: root.fg
-        font.family: root.font_
-        font.pixelSize: Style.font.title
-        font.bold: true
-        textFormat: Text.PlainText
-        elide: Text.ElideRight
-        maximumLineCount: 1
-      }
-
-      Text {
-        width: parent.width
-        text: {
-          if (!root.result) return ""
-          var r = root.result.row
-          var parts = []
-          if (r.ts) parts.push(Classify.formatFullDate(r.ts))
-          if (r.bytes) parts.push(Classify.formatBytes(r.bytes))
-          return parts.join("  ·  ")
-        }
-        color: root.mutedFg
-        font.family: root.font_
-        font.pixelSize: Style.font.caption
-        elide: Text.ElideRight
-        maximumLineCount: 1
-      }
-    }
-
-    Rectangle {
-      id: badge
-      anchors.verticalCenter: parent.verticalCenter
-      radius: height / 2
-      color: root.chipBg
-      width: badgeLabel.implicitWidth + Style.space(14)
-      height: Style.space(20)
-
-      Text {
-        id: badgeLabel
-        anchors.centerIn: parent
-        text: Classify.typeIcon(root.derived) + " " + Classify.typeLabel(root.derived)
-        color: root.mutedFg
-        font.family: root.font_
-        font.pixelSize: Style.font.caption
-      }
-    }
-  }
-
-  Rectangle {
-    id: divider
-    anchors.top: headerRow.bottom
-    anchors.left: parent.left
-    anchors.right: parent.right
-    anchors.topMargin: Style.space(10)
-    height: Style.normalBorderWidth
-    color: root.lineColor
-  }
-
-  // ------------------------------------------------------------- body
-
-  // text-ish body (text / code / json / html / email / number)
-  Flickable {
-    id: textBody
-    anchors.top: divider.bottom
-    anchors.bottom: metaRow.top
-    anchors.left: parent.left
-    anchors.right: parent.right
-    anchors.topMargin: Style.space(10)
-    anchors.bottomMargin: Style.space(10)
-    visible: root.textual && root.bodyText !== ""
-    clip: true
-    contentWidth: width
-    contentHeight: bodyEdit.implicitHeight
-    boundsBehavior: Flickable.StopAtBounds
-
-    WheelHandler {
-      acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
-      onWheel: function(ev) {
-        if (ev.angleDelta.y < 0) textBody.flick(0, -240)
-        else textBody.flick(0, 240)
-        ev.accepted = true
-      }
-    }
-
-    TextEdit {
-      id: bodyEdit
-      width: parent.width
-      readOnly: true
-      activeFocusOnPress: false
-      text: root.bodyText
-      textFormat: TextEdit.PlainText
-      color: root.fg
-      font.family: root.font_
-      font.pixelSize: Style.font.body
-      wrapMode: TextEdit.Wrap
-      selectionColor: Util.alpha(Color.accent, 0.4)
-    }
-  }
-
-  // color body
-  Column {
-    anchors.top: divider.bottom
-    anchors.bottom: metaRow.top
-    anchors.left: parent.left
-    anchors.right: parent.right
-    anchors.topMargin: Style.space(10)
-    anchors.bottomMargin: Style.space(10)
-    visible: root.derived === "color"
-    spacing: Style.space(14)
-
-    Rectangle {
-      width: Math.min(Style.space(240), parent.width)
-      height: Style.space(120)
-      radius: Style.cornerRadius
-      color: root.hexRe.test(root.rawSafe()) ? root.rawSafe() : "transparent"
-      border.width: Style.normalBorderWidth
-      border.color: root.lineColor
-    }
+    width: chipLabel.implicitWidth + Style.space(10)
+    height: chipLabel.implicitHeight + Style.space(4)
+    radius: Math.max(2, root.cornerRadius / 3)
+    color: clickable && chipMouse.containsMouse ? Util.alpha(root.foreground, 0.16) : root.chipBg
 
     Text {
-      text: root.rawSafe()
-      color: root.fg
-      font.family: root.font_
-      font.pixelSize: Style.font.heading
-      font.bold: true
-    }
-
-    Text {
-      visible: root.rgbLine().length > 0
-      text: root.rgbLine()
-      color: root.mutedFg
-      font.family: root.font_
-      font.pixelSize: Style.font.body
-    }
-
-    Text {
-      visible: root.hslLine().length > 0
-      text: root.hslLine()
-      color: root.mutedFg
-      font.family: root.font_
-      font.pixelSize: Style.font.body
-    }
-  }
-
-  // link body
-  Column {
-    anchors.top: divider.bottom
-    anchors.bottom: metaRow.top
-    anchors.left: parent.left
-    anchors.right: parent.right
-    anchors.topMargin: Style.space(10)
-    anchors.bottomMargin: Style.space(10)
-    visible: root.derived === "link"
-    spacing: Style.space(10)
-
-    Text {
-      text: Classify.urlDomain(root.entry ? String(root.entry.text || "") : "")
-      color: Color.accent
-      font.family: root.font_
-      font.pixelSize: Style.font.display
-      font.bold: true
-      elide: Text.ElideRight
-      width: parent.width
-      maximumLineCount: 1
-    }
-
-    Text {
-      text: root.entry ? Classify.firstLine(String(root.entry.text || ""), 400) : ""
-      color: root.fg
-      font.family: root.font_
-      font.pixelSize: Style.font.body
-      wrapMode: Text.WrapAnywhere
-      width: parent.width
-    }
-
-    Text {
-      text: "Ctrl+O opens this link in your browser"
-      color: root.mutedFg
-      font.family: root.font_
+      id: chipLabel
+      textFormat: Text.PlainText
+      anchors.centerIn: parent
+      text: parent.label
+      color: root.foreground
+      opacity: parent.clickable ? 0.9 : 0.7
+      font.family: root.fontFamily
       font.pixelSize: Style.font.caption
     }
 
-    Rectangle {
-      radius: height / 2
-      color: Util.alpha(Color.accent, 0.15)
-      width: linkOpenLabel.implicitWidth + Style.space(16)
-      height: Style.space(22)
-
-      Row {
-        anchors.centerIn: parent
-        spacing: Style.space(4)
-
-        Text {
-          anchors.verticalCenter: parent.verticalCenter
-          text: "󰌹"
-          color: Color.accent
-          font.family: root.font_
-          font.pixelSize: Style.font.caption
-        }
-
-        Text {
-          id: linkOpenLabel
-          anchors.verticalCenter: parent.verticalCenter
-          text: "Open link"
-          color: Color.accent
-          font.family: root.font_
-          font.pixelSize: Style.font.caption
-          font.bold: true
-        }
-      }
-
-      MouseArea {
-        anchors.fill: parent
-        cursorShape: Qt.PointingHandCursor
-        onClicked: root.openAction()
-      }
+    MouseArea {
+      id: chipMouse
+      anchors.fill: parent
+      enabled: parent.clickable
+      hoverEnabled: parent.clickable
+      cursorShape: Qt.PointingHandCursor
+      onClicked: parent.clicked()
     }
   }
 
-  // image body
   Column {
-    anchors.top: divider.bottom
-    anchors.bottom: metaRow.top
-    anchors.left: parent.left
-    anchors.right: parent.right
-    anchors.topMargin: Style.space(10)
-    anchors.bottomMargin: Style.space(10)
-    visible: root.derived === "image"
-    spacing: Style.space(8)
+    anchors.fill: parent
+    anchors.margins: root.pad
+    spacing: Style.space(10)
+    visible: root.row !== null
 
-    // Decoded QR payload sits above the image so it is immediately readable.
-    Rectangle {
-      visible: !!(root.entry && root.entry.qr)
+    // ---- header: type + chips
+    Flow {
+      id: header
       width: parent.width
-      height: qrContent.height + Style.space(12)
-      radius: Style.cornerRadius
-      color: root.chipBg
+      spacing: Style.space(6)
 
-      Column {
-        id: qrContent
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
-        anchors.margins: Style.space(6)
-        anchors.topMargin: Style.space(6)
-        anchors.leftMargin: Style.space(6)
-        anchors.rightMargin: Style.space(6)
-        spacing: Style.space(4)
+      Row {
+        spacing: Style.space(6)
+        height: typeText.implicitHeight + Style.space(4)
 
-        Row {
-          spacing: Style.space(6)
-
-          Text {
-            text: "󰐲"
-            color: Color.accent
-            font.family: root.font_
-            font.pixelSize: Style.font.body
-            anchors.verticalCenter: parent.verticalCenter
-          }
-
-          Text {
-            text: "QR code content"
-            color: Color.accent
-            font.family: root.font_
-            font.pixelSize: Style.font.caption
-            font.bold: true
-            anchors.verticalCenter: parent.verticalCenter
-          }
-
-          Rectangle {
-            radius: height / 2
-            color: Util.alpha(Color.accent, 0.15)
-            width: qrCopyLabel.implicitWidth + Style.space(16)
-            height: Style.space(20)
-            anchors.verticalCenter: parent.verticalCenter
-
-            Text {
-              id: qrCopyLabel
-              anchors.centerIn: parent
-              text: "󰆏 Copy"
-              color: Color.accent
-              font.family: root.font_
-              font.pixelSize: Style.font.caption
-              font.bold: true
-            }
-
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.copyTextAction(root.entry ? String(root.entry.qr || "") : "")
-            }
-          }
+        Text {
+          textFormat: Text.PlainText
+          anchors.verticalCenter: parent.verticalCenter
+          text: root.typeIcon()
+          color: root.selectedText
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.title
         }
 
-        TextEdit {
-          id: qrValue
-          width: parent.width
-          readOnly: true
-          activeFocusOnPress: false
-          text: root.entry && root.entry.qr ? root.entry.qr : ""
-          textFormat: TextEdit.PlainText
-          color: root.fg
-          font.family: root.font_
-          font.pixelSize: Style.font.body
+        Text {
+          id: typeText
+          textFormat: Text.PlainText
+          anchors.verticalCenter: parent.verticalCenter
+          text: root.typeLabel()
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.title
           font.bold: true
-          wrapMode: TextEdit.WrapAnywhere
-          selectionColor: Util.alpha(Color.accent, 0.4)
         }
+      }
 
-        // QR payloads frequently encode links — offer the open affordance.
-        Rectangle {
-          visible: root.qrUrl().length > 0
-          radius: height / 2
-          color: Util.alpha(Color.accent, 0.15)
-          width: qrOpenLabel.implicitWidth + Style.space(16)
-          height: Style.space(20)
-
-          Row {
-            anchors.centerIn: parent
-            spacing: Style.space(4)
-
-            Text {
-              anchors.verticalCenter: parent.verticalCenter
-              text: "󰌹"
-              color: Color.accent
-              font.family: root.font_
-              font.pixelSize: Style.font.caption
-            }
-
-            Text {
-              id: qrOpenLabel
-              anchors.verticalCenter: parent.verticalCenter
-              text: "Open link"
-              color: Color.accent
-              font.family: root.font_
-              font.pixelSize: Style.font.caption
-              font.bold: true
-            }
-          }
-
-          MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: root.openAction()
-          }
+      Repeater {
+        model: root.chips()
+        Chip {
+          required property string modelData
+          label: modelData
         }
       }
     }
 
-    // OCR text recovered from the image (searchable like any text clip).
+    // ---- body
+    Item {
+      id: body
+      width: parent.width
+      height: parent.height - header.height - parent.spacing - (ocrPanel.visible ? ocrPanel.height + parent.spacing : 0)
+
+      // Image: framed, aspect-fit, centered.
+      Rectangle {
+        id: imageFrame
+        visible: root.isImage || (root.isFile && root.imageUrl.length > 0)
+        anchors.fill: parent
+        radius: root.cornerRadius
+        color: Util.alpha(root.foreground, 0.03)
+        border.width: Style.normalBorderWidth
+        border.color: root.lineColor
+
+        Image {
+          id: image
+          anchors.fill: parent
+          anchors.margins: Style.space(8)
+          source: parent.visible ? root.imageUrl : ""
+          fillMode: Image.PreserveAspectFit
+          asynchronous: true
+          smooth: true
+          mipmap: true
+        }
+
+        Text {
+          anchors.centerIn: parent
+          visible: image.status === Image.Error
+          textFormat: Text.PlainText
+          text: Commons.I18n.t("clipboard.imageMissing", "Image file is missing")
+          color: root.foreground
+          opacity: 0.6
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+        }
+      }
+
+      // Link: the URL, large and wrapped, with an open action.
+      Column {
+        visible: root.isLink
+        width: parent.width
+        spacing: Style.space(10)
+
+        Text {
+          textFormat: Text.PlainText
+          width: parent.width
+          text: root.fullText.trim()
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.title
+          wrapMode: Text.WrapAnywhere
+          maximumLineCount: 6
+          elide: Text.ElideRight
+        }
+
+        Chip {
+          label: "󰏌 " + Commons.I18n.t("clipboard.openLink", "Open in browser")
+          clickable: true
+          onClicked: root.openLink()
+        }
+      }
+
+      // Files: one row per path.
+      ListView {
+        visible: root.isFile && !imageFrame.visible
+        anchors.fill: parent
+        clip: true
+        model: root.isFile ? root.filePathList : []
+        spacing: Style.space(2)
+        boundsBehavior: Flickable.StopAtBounds
+
+        delegate: Row {
+          required property string modelData
+          width: ListView.view.width
+          spacing: Style.space(8)
+
+          Text {
+            textFormat: Text.PlainText
+            text: ClipboardHistory.isImagePath(modelData) ? "󰋩" : "󰈔"
+            color: root.foreground
+            opacity: 0.6
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width - Style.space(20)
+            text: modelData
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            elide: Text.ElideMiddle
+          }
+        }
+      }
+
+      // Text: scrollable.
+      Flickable {
+        id: textFlick
+        visible: !root.isImage && !root.isLink && !root.isFile
+        anchors.fill: parent
+        clip: true
+        contentWidth: width
+        contentHeight: bodyText.implicitHeight
+        boundsBehavior: Flickable.StopAtBounds
+
+        Text {
+          id: bodyText
+          textFormat: Text.PlainText
+          width: textFlick.width
+          text: textFlick.visible ? root.fullText : ""
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          wrapMode: Text.WrapAnywhere
+        }
+      }
+    }
+
+    // ---- OCR text under an image
     Rectangle {
       id: ocrPanel
-      visible: !!(root.entry && root.entry.ocr)
+      visible: root.isImage && (root.hasOcr || root.ocrBusy)
       width: parent.width
-      // Never taller than the cap: the body scrolls instead of overflowing
-      // the panel (which used to spill over the image below it).
-      readonly property int maxHeight: Math.max(Style.space(80), Math.floor(parent.height * 0.4))
-      height: Math.min(maxHeight, ocrHeader.height + Style.space(4) + ocrText.implicitHeight + Style.space(12))
-      radius: Style.cornerRadius
-      color: root.chipBg
-      clip: true
+      height: Math.min(Math.round(root.height * 0.3), ocrHeader.height + ocrFlick.contentHeight + Style.space(24))
+      radius: root.cornerRadius
+      color: Util.alpha(root.foreground, 0.03)
+      border.width: Style.normalBorderWidth
+      border.color: root.lineColor
 
       Column {
-        id: ocrContent
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
-        anchors.topMargin: Style.space(6)
-        anchors.leftMargin: Style.space(6)
-        anchors.rightMargin: Style.space(6)
-        spacing: Style.space(4)
+        anchors.fill: parent
+        anchors.margins: Style.space(8)
+        spacing: Style.space(6)
 
         Row {
           id: ocrHeader
           width: parent.width
-          spacing: Style.space(8)
+          spacing: Style.space(6)
 
           Text {
-            text: "󰐦 Recognized text (OCR)"
-            color: Color.accent
-            font.family: root.font_
+            textFormat: Text.PlainText
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.ocrBusy
+              ? Commons.I18n.t("clipboard.ocrReading", "Reading text…")
+              : Commons.I18n.t("clipboard.ocrTitle", "Text in image")
+            color: root.foreground
+            opacity: 0.7
+            font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             font.bold: true
-            anchors.verticalCenter: parent.verticalCenter
           }
 
-          Rectangle {
-            radius: height / 2
-            color: Util.alpha(Color.accent, 0.15)
-            width: ocrCopyLabel.implicitWidth + Style.space(16)
-            height: Style.space(20)
+          Chip {
+            visible: root.hasOcr
             anchors.verticalCenter: parent.verticalCenter
-
-            Text {
-              id: ocrCopyLabel
-              anchors.centerIn: parent
-              text: "󰆏 Copy text"
-              color: Color.accent
-              font.family: root.font_
-              font.pixelSize: Style.font.caption
-              font.bold: true
-            }
-
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.copyTextAction(root.entry ? String(root.entry.ocr || "") : "")
-            }
+            label: Commons.I18n.t("common.copy", "Copy")
+            clickable: true
+            onClicked: root.copyText(root.ocrText)
           }
         }
 
         Flickable {
           id: ocrFlick
           width: parent.width
-          height: ocrPanel.height - ocrHeader.height - Style.space(4) - Style.space(12)
+          height: parent.height - ocrHeader.height - parent.spacing
           clip: true
           contentWidth: width
-          contentHeight: ocrText.implicitHeight
+          contentHeight: ocrBody.implicitHeight
           boundsBehavior: Flickable.StopAtBounds
 
-          WheelHandler {
-            acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
-            onWheel: function(ev) {
-              if (ev.angleDelta.y < 0) ocrFlick.flick(0, -240)
-              else ocrFlick.flick(0, 240)
-              ev.accepted = true
-            }
-          }
-
-          TextEdit {
-            id: ocrText
-            width: parent.width
-            readOnly: true
-            activeFocusOnPress: false
-            text: root.entry && root.entry.ocr ? root.entry.ocr : ""
-            textFormat: TextEdit.PlainText
-            color: root.fg
-            font.family: root.font_
-            font.pixelSize: Style.font.caption
-            wrapMode: TextEdit.Wrap
-            selectionColor: Util.alpha(Color.accent, 0.4)
-          }
-        }
-      }
-    }
-
-    Item {
-      width: parent.width
-      height: Math.max(0, parent.height
-             - (root.entry && root.entry.qr ? qrContent.height + Style.space(12) + Style.space(8) : 0)
-             - (root.entry && root.entry.ocr ? ocrPanel.height + Style.space(8) : 0)
-             - infoLabel.height - Style.space(12))
-
-      Image {
-        id: img
-        anchors.centerIn: parent
-        width: parent.width
-        height: parent.height
-        source: root.entry && root.entry.path ? Util.fileUrl(root.entry.path) : ""
-        fillMode: Image.PreserveAspectFit
-        asynchronous: true
-        smooth: true
-        cache: false
-      }
-
-      Rectangle {
-        anchors.fill: img
-        color: "transparent"
-        border.width: Style.normalBorderWidth
-        border.color: root.lineColor
-        radius: Style.space(4)
-        visible: img.status === Image.Ready
-      }
-
-      Text {
-        anchors.centerIn: parent
-        visible: img.status === Image.Error || img.status === Image.Null
-        text: "Preview unavailable"
-        color: root.mutedFg
-        font.family: root.font_
-        font.pixelSize: Style.font.body
-      }
-    }
-
-    Text {
-      id: infoLabel
-      text: {
-        if (!root.entry) return ""
-        var e = root.entry
-        var dims = e.w && e.h ? e.w + " × " + e.h + " px  ·  " : ""
-        return dims + (e.mime || "image") + (e.bytes ? "  ·  " + Classify.formatBytes(e.bytes) : "")
-      }
-      color: root.mutedFg
-      font.family: root.font_
-      font.pixelSize: Style.font.caption
-    }
-  }
-
-  // File content is bounded by a scrollable viewport, including long paths
-  // and text snippets. Selecting another file loads its details on demand.
-  Flickable {
-    id: filesBody
-    anchors.top: divider.bottom
-    anchors.bottom: metaRow.top
-    anchors.left: parent.left
-    anchors.right: parent.right
-    anchors.topMargin: Style.space(10)
-    anchors.bottomMargin: Style.space(10)
-    visible: root.derived === "files"
-    clip: true
-    contentWidth: width
-    contentHeight: fileContent.height
-    boundsBehavior: Flickable.StopAtBounds
-    Connections {
-      target: root
-      function onSelectedFileChanged() { filesBody.contentY = 0 }
-    }
-    WheelHandler {
-      acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
-      onWheel: function(ev) {
-        filesBody.flick(0, ev.angleDelta.y < 0 ? -240 : 240)
-        ev.accepted = true
-      }
-    }
-    Column {
-      id: fileContent
-      width: filesBody.width
-      spacing: Style.space(8)
-      Row {
-        width: parent.width
-        spacing: Style.space(8)
-        visible: root.filePaths.length > 1
-        Repeater {
-          model: ["‹ Previous", "Next ›"]
-          delegate: Rectangle {
-            required property int index
-            required property string modelData
-            width: navLabel.implicitWidth + Style.space(16)
-            height: Style.space(24)
-            color: root.chipBg
-            radius: Style.cornerRadius
-            Text {
-              id: navLabel
-              anchors.centerIn: parent
-              text: modelData
-              color: root.fg
-              font.family: root.font_
-              font.pixelSize: Style.font.caption
-            }
-            MouseArea {
-              anchors.fill: parent
-              onClicked: root.fileIndex = (root.fileIndex + (index === 0 ? -1 : 1) + root.filePaths.length) % root.filePaths.length
-            }
-          }
-        }
-        Text {
-          text: (root.fileIndex + 1) + " / " + root.filePaths.length
-          color: root.mutedFg
-          font.family: root.font_
-          font.pixelSize: Style.font.caption
-        }
-      }
-      Text {
-        width: parent.width
-        text: Classify.fileBase(root.selectedFile)
-        textFormat: Text.PlainText
-        wrapMode: Text.WrapAnywhere
-        color: root.fg
-        font.family: root.font_
-        font.pixelSize: Style.font.body
-        font.bold: true
-      }
-      Rectangle {
-        id: thumbnailPanel
-        readonly property bool loading: fileDelay.running || fileProbe.running || fileThumbnail.status === Image.Loading
-        width: parent.width
-        height: visible ? Math.min(Style.space(240), filesBody.height * 0.55) : 0
-        visible: loading || !!root.fileInfo.thumbnail
-        color: root.chipBg
-        radius: Style.cornerRadius
-        clip: true
-        Image {
-          id: fileThumbnail
-          anchors.fill: parent
-          visible: status === Image.Ready && !thumbnailPanel.loading
-          source: root.fileInfo.thumbnail || ""
-          fillMode: Image.PreserveAspectFit
-          asynchronous: true
-          sourceSize.width: 640
-          sourceSize.height: 360
-        }
-        Column {
-          anchors.centerIn: parent
-          spacing: Style.space(8)
-          visible: thumbnailPanel.loading
           Text {
-            anchors.horizontalCenter: parent.horizontalCenter
-            text: "◌"
-            color: Color.accent
-            font.pixelSize: Style.space(28)
-            NumberAnimation on rotation {
-              from: 0
-              to: 360
-              duration: 1000
-              loops: Animation.Infinite
-              running: thumbnailPanel.loading && filesBody.visible
-            }
+            id: ocrBody
+            textFormat: Text.PlainText
+            width: ocrFlick.width
+            text: root.ocrText
+            color: root.foreground
+            opacity: 0.85
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WrapAnywhere
           }
-          Text {
-            text: "Loading preview…"
-            color: root.mutedFg
-            font.family: root.font_
-            font.pixelSize: Style.font.caption
-          }
-        }
-        Text {
-          anchors.centerIn: parent
-          visible: !thumbnailPanel.loading && fileThumbnail.status === Image.Error
-          text: "Thumbnail unavailable"
-          color: root.mutedFg
-          font.family: root.font_
-          font.pixelSize: Style.font.caption
-        }
-      }
-      Text {
-        width: parent.width
-        text: root.fileInfo.error || root.fileDetails() || (thumbnailPanel.loading ? "Loading file information…" : "File information unavailable")
-        textFormat: Text.PlainText
-        wrapMode: Text.WrapAnywhere
-        color: root.mutedFg
-        font.family: root.font_
-        font.pixelSize: Style.font.caption
-      }
-      Text {
-        width: parent.width
-        text: root.selectedFile
-        textFormat: Text.PlainText
-        wrapMode: Text.WrapAnywhere
-        color: root.mutedFg
-        font.family: root.font_
-        font.pixelSize: Style.font.caption
-      }
-      TextEdit {
-        width: parent.width
-        visible: text.length > 0
-        text: root.fileInfo.text || root.fileInfo.details || ""
-        textFormat: TextEdit.PlainText
-        readOnly: true
-        activeFocusOnPress: false
-        wrapMode: TextEdit.WrapAnywhere
-        color: root.fg
-        font.family: root.font_
-        font.pixelSize: Style.font.body
-      }
-      Text {
-        visible: !!root.fileInfo.truncated
-        text: "Preview limited to the first 8 KiB"
-        color: root.mutedFg
-        font.family: root.font_
-        font.pixelSize: Style.font.caption
-      }
-    }
-  }
-
-  // ------------------------------------------------------------- meta chips
-
-  Row {
-    id: metaRow
-    anchors.bottom: parent.bottom
-    anchors.left: parent.left
-    anchors.right: parent.right
-    spacing: Style.space(6)
-
-    Rectangle {
-      width: Style.space(20)
-      height: Style.space(20)
-      radius: height / 2
-      color: root.chipBg
-      anchors.verticalCenter: parent.verticalCenter
-
-      Text {
-        anchors.centerIn: parent
-        text: Classify.typeIcon(root.derived)
-        color: root.mutedFg
-        font.family: root.font_
-        font.pixelSize: Style.font.caption
-      }
-    }
-
-    Rectangle {
-      radius: height / 2
-      color: root.chipBg
-      width: typeChipText.implicitWidth + Style.space(14)
-      height: Style.space(20)
-      anchors.verticalCenter: parent.verticalCenter
-
-      Text {
-        id: typeChipText
-        anchors.centerIn: parent
-        text: Classify.typeLabel(root.derived)
-        color: root.mutedFg
-        font.family: root.font_
-        font.pixelSize: Style.font.caption
-      }
-    }
-
-    Repeater {
-      model: root.metaChips()
-
-      delegate: Rectangle {
-        required property var modelData
-        property string chipText: String(modelData)
-
-        radius: height / 2
-        color: root.chipBg
-        width: chipLabel.implicitWidth + Style.space(14)
-        height: Style.space(20)
-        anchors.verticalCenter: parent.verticalCenter
-
-        Text {
-          id: chipLabel
-          anchors.centerIn: parent
-          text: parent.chipText
-          textFormat: Text.PlainText
-          color: root.mutedFg
-          font.family: root.font_
-          font.pixelSize: Style.font.caption
         }
       }
     }
   }
-
-  readonly property var hexRe: /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i
 }

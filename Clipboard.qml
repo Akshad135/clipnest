@@ -3,74 +3,75 @@ import Quickshell.Io
 import Quickshell.Wayland
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
-import "Store.js" as Store
-import "Fuzzy.js" as Fuzzy
-import "Classify.js" as Classify
+import "ClipboardHistory.js" as ClipboardHistory
 
-// Clipboard history picker — Raycast-style: fuzzy search bar, result list,
-// and a per-type preview pane. Clone of omarchy.clipboard with richer
-// capture metadata (app, size, dims, pins, usage) and full-text fuzzy filtering.
+// akshad135.clipboard: a clone of omarchy.clipboard. Same history file, capture flow and paste
+// scripts; adds pins, category tabs, a per-type preview pane with lazy OCR,
+// and a key-hint footer. One box style, one chip style, one pin glyph.
 Item {
   id: root
 
+  property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   property bool opened: false
   property string filterText: ""
-  property string typeFilter: "" // chip filter, "" = all; combined into the query
+  property string category: "all"
   property int selectedIndex: 0
   property bool cursorActive: false
-  property bool cursorVisible: true
   property bool clearConfirmOpen: false
   property var history: []
-  property var results: [] // [{ row, score, positions }]
+  property int pinnedCount: 0
 
+  property string historyPath: Quickshell.env("HOME") + "/.local/state/omarchy/clipboard-history.json"
   property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, "")
-  property string statePath: Quickshell.env("HOME") + "/.local/state/omarchy/clipboard-history-rich.json"
-  property int historyLimit: 1500
-  property int displayLimit: 200
-  property int maxAgeDays: 0 // 0 = keep forever
-  property bool qrDecode: true
-  property bool ocr: true
-  property string ocrLang: "eng"
-  property bool paused: false
-  property var typeCache: ({}) // id → derived type, memoized
+  property string captureScript: root.pluginDir + "/capture.sh"
 
-  // Theme surface tokens (menu) — tracks the active Omarchy theme.
-  property color background: Color.menu.background
-  property color foreground: Color.menu.text
-  property color border: Color.menu.border
+  // Shares the [menu] surface tokens — themes that style the menu also style
+  // the clipboard.
+  property color background: Commons.Color.menu.background
+  property color foreground: Commons.Color.menu.text
+  property color border: Commons.Color.menu.border
   property var borderSpec: Border.surfaceSpec("menu", "border", border, Math.max(1, Style.space(2)))
-  property color scrim: Color.menu.scrim
-  property color selectedBackground: Color.menu.selectedBackground
-  property color selectedText: Color.menu.selectedText
-  property color accent: Color.accent
-  property color mutedFg: Util.alpha(foreground, 0.55)
-  property color chipBg: Util.alpha(foreground, 0.07)
+  property color scrim: Commons.Color.menu.scrim
+  property color selectedBackground: Commons.Color.menu.selectedBackground
+  property color selectedText: Commons.Color.menu.selectedText
   property color lineColor: Util.alpha(foreground, 0.14)
+  property color chipBg: Util.alpha(foreground, 0.08)
   readonly property int cornerRadius: Style.cornerRadius
-  readonly property string fontFamily: Style.font.menuFamily
-  readonly property int contentMargin: Style.spacing.panelPadding
-  readonly property int headerHeight: Math.max(Style.space(40), Style.font.heading + Style.spacing.controlPaddingY * 2)
-  readonly property int cardWidth: Style.space(980)
-  readonly property int cardHeight: Style.space(680)
-  readonly property int rowHeight: Style.space(52)
-  readonly property int listWidth: Math.round(card.width * 0.46)
+  readonly property int boxRadius: Math.max(2, Math.round(Style.cornerRadius * 0.6))
+  property string fontFamily: Style.font.menuFamily
+  property int contentMargin: Style.spacing.panelPadding
+  property int contentSpacing: Style.spacing.md
+  property int searchHeight: Math.max(Style.space(40), Style.font.heading + Style.spacing.controlPaddingY * 2 + Style.space(8))
+  property int tabsHeight: Style.font.caption + Style.spacing.controlPaddingY * 2
+  property int footerHeight: Style.font.caption + Style.space(12)
+  property int cardWidth: Math.min(Style.space(960), panel.width - Style.gapsOut * 2)
+  property int cardHeight: Math.min(Style.space(640), panel.height - Style.gapsOut * 2)
+  property int rowHeight: Math.max(Style.space(44), Style.font.title + Style.spacing.rowPaddingX * 2)
+  property int sectionHeight: Style.space(22)
+  property int historyLimit: 500
 
-  readonly property var currentResult: results.length > 0 && selectedIndex >= 0 && selectedIndex < results.length ? results[selectedIndex] : null
+  readonly property var currentRow: displayModel.count > 0 && selectedIndex >= 0 && selectedIndex < displayModel.count ? displayModel.get(selectedIndex) : null
+  readonly property bool selectedPinned: root.cursorActive && displayModel.count > 0 && root.selectedIndex < root.pinnedCount
+
+  // OCR: tesseract runs once per image, on first preview, and the result is
+  // saved into the entry so it is searchable afterwards.
+  property bool ocrAvailable: false
+  property string ocrPath: ""
 
   // ------------------------------------------------------------ lifecycle
 
-  function open() {
+  function open(payloadJson) {
     root.opened = true
-    root.depsChecked = false
-    root.checkDeps()
-    root.filterText = ""
-    root.typeFilter = ""
+    root.category = "all"
     root.selectedIndex = 0
     root.cursorActive = true
     root.disarmPointer()
-    root.rebuild()
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    filterInput.text = ""
+    root.filterText = ""
+    root.rebuildDisplay()
+    Qt.callLater(function() { filterInput.forceActiveFocus() })
   }
 
   function close() {
@@ -80,160 +81,228 @@ Item {
 
   function toggle() {
     if (root.opened) root.close()
-    else root.open()
+    else root.open("{}")
   }
 
-  // ------------------------------------------------------------ pause
-  // Toggle via IPC:  omarchy-shell shell call alanfortlink.clipboard pause '{"paused":true}'
-  // (or {"paused":false}, or {"paused":"toggle"}), and Ctrl+Space in the picker.
-  function setPaused(next) {
-    root.paused = !!next
-    pausedFile.setText(JSON.stringify({ paused: root.paused }) + "\n")
-  }
-
-  function pause(payloadJson) {
-    var p = null
-    try { p = JSON.parse(String(payloadJson || "{}")) } catch (e) { p = null }
-    var next = p && typeof p.paused !== "undefined"
-      ? (p.paused === "toggle" ? !root.paused : !!p.paused)
-      : !root.paused
-    root.setPaused(next)
-    Quickshell.execDetached(["notify-send", "-a", "Clipboard History",
-      next ? "Clipboard history paused" : "Clipboard history resumed",
-      next ? "New copies are not being recorded." : "Recording new copies again."])
-    return JSON.stringify({ paused: root.paused })
-  }
-
-  function isPaused() { return JSON.stringify({ paused: root.paused }) }
-
-  // Screenshot helper: omarchy-shell shell call alanfortlink.clipboard debugSetFilter '{"text":"…"}'
-  // Opens the picker with a preset query so scripts can capture it keyboard-free.
-  function debugSetFilter(payloadJson) {
-    var p = {}
-    try { p = JSON.parse(String(payloadJson || "{}")) } catch (e) { p = {} }
-    root.open()
-    root.setFilter(String(p.text || ""))
-    return "ok"
-  }
-
-  // ------------------------------------------------------------ store
+  // ------------------------------------------------------------ history
 
   function loadHistory(raw) {
-    root.history = Store.parseHistory(raw, Math.floor(Date.now() / 1000))
-    root.typeCache = {}
-    root.applyRetentionPolicy()
-    root.checkDeps()
-    if (root.opened) root.rebuild()
+    root.history = ClipboardHistory.parseHistory(raw)
+    if (root.opened) root.rebuildDisplay()
   }
 
   function saveHistory() {
-    var pruned = Store.prune(root.history, root.historyLimit)
-    var aged = Store.pruneByAge(pruned.entries, root.maxAgeDays > 0 ? root.maxAgeDays * 86400 : -1, Math.floor(Date.now() / 1000))
-    root.history = aged.entries
-    historyFile.setText(JSON.stringify(root.history, null, 1) + "\n")
-    var paths = pruned.droppedImagePaths.concat(aged.droppedImagePaths)
-    if (paths.length > 0) queueGc(paths)
+    historyFile.setText(JSON.stringify(root.history.slice(0, root.historyLimit), null, 2) + "\n")
   }
 
-  // Full retention pass, run when history loads and when settings change.
-  function applyRetentionPolicy() {
-    if (root.maxAgeDays <= 0) return
-    var aged = Store.pruneByAge(root.history, root.maxAgeDays * 86400, Math.floor(Date.now() / 1000))
-    if (aged.entries.length === root.history.length) return
-    root.history = aged.entries
-    if (aged.droppedImagePaths.length > 0) queueGc(aged.droppedImagePaths)
+  function addClipboardEntry(entry) {
+    var normalized = ClipboardHistory.normalizeEntry(entry)
+    if (!normalized) return
+
+    root.history = ClipboardHistory.addEntry(root.history, normalized, root.historyLimit)
     root.saveHistory()
-  }
-
-  // Serialize GC batches: a single reusable Process would silently drop
-  // overlapping runs, so pending paths queue until the current rm exits.
-  property var gcQueue: []
-  function queueGc(paths) {
-    root.gcQueue.push(paths)
-    if (!gcProc.running) runNextGc()
-  }
-  function runNextGc() {
-    if (root.gcQueue.length === 0) return
-    gcProc.command = ["rm", "-f"].concat(root.gcQueue.shift())
-    gcProc.running = true
+    if (root.opened) root.rebuildDisplay()
   }
 
   function addClipboardJson(line) {
-    if (root.paused) return
-    var entry = null
-    try { entry = JSON.parse(String(line || "")) } catch (e) { return }
-    if (!entry) return
-    root.history = Store.addEntry(root.history, entry, Math.floor(Date.now() / 1000))
-    root.saveHistory()
-    if (root.opened) root.rebuild()
+    root.addClipboardEntry(ClipboardHistory.parseEntryJson(line))
   }
 
-  // ------------------------------------------------------------ search
+  // One confirm box for the destructive actions: "clear" (Shift+Del),
+  // "deletePinned" (Ctrl+Del on a pin), "unpinAll" (Shift+Tab).
+  property string confirmAction: ""
+  property int confirmHistoryIndex: -1
 
-  function effectiveQuery() {
-    var q = root.filterText
-    if (root.typeFilter === "pinned") return q + (q ? " " : "") + "is:pinned"
-    if (root.typeFilter) return "type:" + root.typeFilter + (q ? " " + q : "")
-    return q
+  function confirmMessage() {
+    var t = Commons.I18n.t
+    if (root.confirmAction === "deletePinned") return t("clipboard.deletePinned", "Delete this pinned entry?")
+    if (root.confirmAction === "unpinAll") return t("clipboard.unpinAll", "Unpin all entries?")
+    return t("clipboard.deleteHistory")
   }
 
-  function rebuild() {
-    var now = Math.floor(Date.now() / 1000)
-    var rows = []
-    for (var i = 0; i < root.history.length; i++) {
-      var entry = root.history[i]
-      var derived = root.typeCache[entry.id]
-      if (derived === undefined) {
-        derived = Classify.deriveType(entry)
-        root.typeCache[entry.id] = derived
-      }
-      rows.push(Store.buildRow(entry, derived, now))
+  function confirmLabel() {
+    var t = Commons.I18n.t
+    if (root.confirmAction === "unpinAll") return t("clipboard.unpin", "Unpin")
+    return t("common.delete")
+  }
+
+  function requestConfirm(action, historyIndex) {
+    root.confirmAction = action
+    root.confirmHistoryIndex = historyIndex === undefined ? -1 : historyIndex
+    clearConfirm.selectedIndex = 1
+    root.clearConfirmOpen = true
+  }
+
+  function requestClearHistory() {
+    if (root.history.length === 0) return
+    root.requestConfirm("clear")
+  }
+
+  function requestDeletePinned(index) {
+    var row = root.rowAt(index)
+    if (!row || !row.pinned) return
+    root.requestConfirm("deletePinned", row.historyIndex)
+  }
+
+  function requestUnpinAll() {
+    if (root.pinnedCount === 0) return
+    root.requestConfirm("unpinAll")
+  }
+
+  function cancelClearHistory() {
+    root.clearConfirmOpen = false
+    root.confirmAction = ""
+    root.disarmPointer()
+    Qt.callLater(function() { filterInput.forceActiveFocus() })
+  }
+
+  function confirmClearHistory() {
+    var keepIndex = -1
+    if (root.confirmAction === "deletePinned") {
+      root.history = ClipboardHistory.removeEntryAt(root.history, root.confirmHistoryIndex, true)
+      root.selectedIndex = Math.max(0, root.selectedIndex - 1)
+    } else if (root.confirmAction === "unpinAll") {
+      // Keep the cursor on the same entry after it moves out of the pin section.
+      var row = root.currentRow
+      keepIndex = row ? row.historyIndex : -1
+      root.history = ClipboardHistory.unpinAll(root.history)
+    } else {
+      root.history = ClipboardHistory.clearHistory(root.history)
+      root.selectedIndex = 0
     }
-    root.results = Fuzzy.searchRows(rows, root.effectiveQuery(), now, root.displayLimit)
+    root.saveHistory()
+    root.cursorActive = root.history.length > 0
+    root.disarmPointer()
+    root.clearConfirmOpen = false
+    root.confirmAction = ""
+    root.rebuildDisplay()
+    if (keepIndex >= 0) root.selectHistoryIndex(keepIndex)
+    Qt.callLater(function() { filterInput.forceActiveFocus() })
+  }
 
-    if (root.results.length === 0) root.selectedIndex = 0
-    else if (root.selectedIndex >= root.results.length) root.selectedIndex = root.results.length - 1
+  function selectHistoryIndex(historyIndex) {
+    for (var i = 0; i < displayModel.count; i++) {
+      if (displayModel.get(i).historyIndex === historyIndex) {
+        root.selectedIndex = i
+        return
+      }
+    }
+  }
 
+  function togglePinIndex(index) {
+    if (index < 0 || index >= displayModel.count) return
+
+    var historyIndex = displayModel.get(index).historyIndex
+    root.history = ClipboardHistory.togglePinAt(root.history, historyIndex)
+    root.saveHistory()
+    root.disarmPointer()
+    root.rebuildDisplay()
+    root.selectHistoryIndex(historyIndex)
     Qt.callLater(function() {
-      if (root.results.length > 0) resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
+      if (displayModel.count > 0) resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
     })
   }
 
-  function setFilter(next) {
-    root.filterText = next
-    root.selectedIndex = 0
-    root.cursorActive = true
+  function removeDisplayIndex(index) {
+    if (index < 0 || index >= displayModel.count) return
+
+    var row = displayModel.get(index)
+    if (row.pinned) return // Delete never removes a pin; unpin first (Tab).
+    root.history = ClipboardHistory.removeEntryAt(root.history, row.historyIndex)
+    root.saveHistory()
+
+    if (displayModel.count <= 1) {
+      root.selectedIndex = 0
+      root.cursorActive = false
+    } else if (root.selectedIndex >= displayModel.count - 1) {
+      root.selectedIndex = displayModel.count - 2
+    }
+
     root.disarmPointer()
-    root.rebuild()
+    root.rebuildDisplay()
   }
 
-  function setTypeFilter(next) {
-    root.typeFilter = next
-    root.selectedIndex = 0
-    root.disarmPointer()
-    root.rebuild()
+  function rebuildDisplay() {
+    var rows = ClipboardHistory.displayRows(root.history, root.filterText, 50, Commons.I18n.t, Commons.I18n.tn, Commons.I18n.formatNumber, root.category)
+
+    displayModel.clear()
+    var pins = 0
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i]
+      if (row.pinned) pins++
+      displayModel.append({
+        entryType: row.entryType,
+        category: row.category,
+        fullText: row.fullText,
+        previewText: row.previewText,
+        previewImage: row.previewImage ? Util.fileUrl(row.previewImage) : "",
+        path: row.path,
+        mime: row.mime,
+        pinned: row.pinned,
+        section: row.section,
+        capturedAt: row.capturedAt,
+        ocr: row.ocr,
+        truncated: row.truncated,
+        historyIndex: row.index
+      })
+    }
+    root.pinnedCount = pins
+
+    if (displayModel.count === 0) selectedIndex = 0
+    else if (selectedIndex >= displayModel.count) selectedIndex = displayModel.count - 1
+    else if (selectedIndex < 0) selectedIndex = 0
+
+    Qt.callLater(function() {
+      if (displayModel.count > 0) resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
+    })
   }
 
-  // ------------------------------------------------------------ navigation
+  Connections {
+    target: Commons.I18n
+    function onStringsChanged() { if (root.opened) root.rebuildDisplay() }
+  }
+
+  // ------------------------------------------------------------ selection
 
   function select(delta) {
-    if (root.results.length === 0) return
+    if (displayModel.count === 0) return
     root.disarmPointer()
-    if (!root.cursorActive) {
-      root.cursorActive = true
-      root.selectedIndex = delta < 0 ? root.results.length - 1 : 0
+    if (!cursorActive) {
+      cursorActive = true
+      selectedIndex = delta < 0 ? displayModel.count - 1 : 0
     } else {
-      root.selectedIndex = (root.selectedIndex + delta + root.results.length) % root.results.length
+      selectedIndex = (selectedIndex + delta + displayModel.count) % displayModel.count
     }
-    resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
+    resultList.positionViewAtIndex(selectedIndex, ListView.Contain)
   }
 
   function selectAbsolute(index) {
-    if (root.results.length === 0) return
+    if (displayModel.count === 0) return
     root.disarmPointer()
     root.cursorActive = true
-    root.selectedIndex = Math.max(0, Math.min(index, root.results.length - 1))
+    root.selectedIndex = Math.max(0, Math.min(index, displayModel.count - 1))
     resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
+  }
+
+  function setFilter(nextFilter) {
+    root.filterText = nextFilter
+    root.selectedIndex = 0
+    root.cursorActive = true
+    root.disarmPointer()
+    root.rebuildDisplay()
+  }
+
+  function setCategory(next) {
+    if (next === root.category) return
+    root.category = next
+    root.selectedIndex = 0
+    root.cursorActive = true
+    root.disarmPointer()
+    root.rebuildDisplay()
+  }
+
+  function cycleCategory(delta) {
+    root.setCategory(ClipboardHistory.nextCategory(root.category, delta))
   }
 
   function disarmPointer() {
@@ -248,190 +317,126 @@ Item {
 
   // ------------------------------------------------------------ actions
 
-  function pasteResult(result) {
-    if (!result) return
-    root.close()
-    root.history = Store.touch(root.history, result.row.entry.id, Math.floor(Date.now() / 1000))
-    root.saveHistory()
-    Quickshell.execDetached([root.pluginDir + "/paste-entry.sh", result.row.entry.id])
+  function rowAt(index) {
+    if (index < 0 || index >= displayModel.count) return null
+    return displayModel.get(index)
   }
 
-  function copyResult(result) {
-    if (!result) return
-    root.close()
-    Quickshell.execDetached([root.pluginDir + "/paste-entry.sh", result.row.entry.id, "--copy-only"])
-  }
-
-  function openResult(result) {
-    if (!result) return
-    root.close()
-    Quickshell.execDetached([root.pluginDir + "/open-entry.sh", result.row.entry.id])
-  }
-
-  // Text content of an entry as a string: the text itself, or for images the
-  // recognized (OCR) text, falling back to a decoded QR payload.
-  function textContent(result) {
-    if (!result) return ""
-    var e = result.row.entry
-    if (e.type === "image") return String(e.ocr || e.qr || "")
-    return String(e.text || "")
-  }
-
-  // Copy a plain string (not an entry) to the clipboard and close.
-  function copyText(text) {
-    if (!text) return
-    root.close()
-    Quickshell.execDetached(["wl-copy", "--type", "text/plain", "--", text])
-  }
-
-  function removeIndex(index) {
-    if (index < 0 || index >= root.results.length) return
-    var entry = root.results[index].row.entry
-    root.history = Store.removeById(root.history, entry.id)
-    delete root.typeCache[entry.id]
-    root.saveHistory()
-    if (root.results.length <= 1) root.selectedIndex = 0
-    else if (root.selectedIndex >= root.results.length - 1) root.selectedIndex = root.results.length - 2
-    root.rebuild()
-  }
-
-  function togglePinIndex(index) {
-    if (index < 0 || index >= root.results.length) return
-    root.history = Store.togglePin(root.history, root.results[index].row.entry.id)
-    root.saveHistory()
-    root.rebuild()
-  }
-
-  function requestClearHistory() {
-    if (root.history.length === 0) return
-    clearConfirm.selectedIndex = 1
-    root.clearConfirmOpen = true
-  }
-
-  function cancelClearHistory() {
-    root.clearConfirmOpen = false
-    root.disarmPointer()
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
-  }
-
-  function confirmClearHistory() {
-    var dropped = []
-    for (var i = 0; i < root.history.length; i++) {
-      if (root.history[i].type === "image" && root.history[i].path) dropped.push(root.history[i].path)
+  function applySelected(row) {
+    if (!row) return
+    root.opened = false
+    if (row.entryType === "image") {
+      Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-clipboard-paste-file", row.mime, row.path])
+    } else if (row.fullText) {
+      Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-clipboard-paste-text", "--shift-insert", "--history-index", String(row.historyIndex)])
     }
-    root.history = []
-    root.typeCache = {}
-    root.saveHistory()
-    if (dropped.length > 0) queueGc(dropped)
-    root.selectedIndex = 0
-    root.clearConfirmOpen = false
-    root.rebuild()
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
+
+  function copySelected(row) {
+    if (!row) return
+    root.opened = false
+    if (row.entryType === "image") {
+      Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-clipboard-paste-file", "--copy-only", row.mime, row.path])
+    } else if (row.fullText) {
+      Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-clipboard-paste-text", "--copy-only", "--history-index", String(row.historyIndex)])
+    }
+  }
+
+  // Links go to the browser, images to the viewer, text to the editor —
+  // all via Omarchy's own script.
+  function openSelected(row) {
+    if (!row) return
+    root.opened = false
+    Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-clipboard-open", "--history-index", String(row.historyIndex)])
+  }
+
+  function copyPlain(text) {
+    if (!text) return
+    root.opened = false
+    Quickshell.execDetached(["sh", "-c", 'printf %s "$1" | wl-copy', "clipboard-copy", String(text)])
+  }
+
+  // Ctrl+Shift+P: the file path behind an image or file entry.
+  function copyPathOf(row) {
+    if (!row) return
+    if (row.entryType === "image") root.copyPlain(row.path)
+    else if (row.entryType === "file") root.copyPlain(row.fullText)
+  }
+
+  // Ctrl+Shift+C: the entry as plain text — OCR text for images.
+  function copyTextOf(row) {
+    if (!row) return
+    if (row.entryType === "image") root.copyPlain(String(row.ocr || ""))
+    else root.copyPlain(row.fullText)
+  }
+
+  function hasPath(row) {
+    return !!row && (row.entryType === "image" || row.entryType === "file")
+  }
+
+  function canOpen(row) {
+    return !!row && (row.entryType === "image" || row.entryType === "file" || row.category === "links")
+  }
+
+  // Footer hints follow the selected entry's type.
+  function footerHints() {
+    var row = root.currentRow
+    var t = Commons.I18n.t
+    var hints = [
+      ["↵", t("clipboard.hintPaste", "paste")],
+      ["⇧↵", t("clipboard.hintCopy", "copy")]
+    ]
+    if (root.canOpen(row)) hints.push(["^O", t("clipboard.hintOpen", "open")])
+    if (root.hasPath(row)) hints.push(["^⇧P", t("clipboard.hintCopyPath", "copy path")])
+    if (row && row.entryType === "image" && row.ocr) hints.push(["^⇧C", t("clipboard.hintCopyText", "copy text")])
+    hints.push(["Tab", root.selectedPinned ? t("clipboard.hintUnpin", "unpin") : t("clipboard.hintPin", "pin")])
+    if (root.pinnedCount > 0) hints.push(["⇧Tab", t("clipboard.hintUnpinAll", "unpin all")])
+    if (row && row.pinned) hints.push(["^Del", t("clipboard.hintDeletePinned", "delete pin")])
+    else hints.push(["Del", t("clipboard.hintDelete", "delete")])
+    hints.push(["⇧Del", t("clipboard.hintClear", "clear")])
+    hints.push(["←→", t("clipboard.hintCategory", "category")])
+    hints.push(["^N ^P", t("clipboard.hintMove", "move")])
+    return hints
+  }
+
+  // ------------------------------------------------------------ OCR
+
+  function maybeStartOcr() {
+    if (!root.opened || !root.ocrAvailable || ocrProc.running) return
+    var row = root.currentRow
+    if (!row || row.entryType !== "image") return
+    if (row.ocr !== null && row.ocr !== undefined) return
+    root.ocrPath = row.path
+    ocrProc.running = true
+  }
+
+  function finishOcr(path, text) {
+    root.history = ClipboardHistory.setOcrForPath(root.history, path, String(text || "").trim())
+    root.saveHistory()
+    root.ocrPath = ""
+    if (root.opened) {
+      var keep = root.selectedIndex
+      root.rebuildDisplay()
+      root.selectedIndex = Math.min(keep, Math.max(0, displayModel.count - 1))
+      Qt.callLater(root.maybeStartOcr)
+    }
+  }
+
+  onCurrentRowChanged: Qt.callLater(root.maybeStartOcr)
+  onOpenedChanged: if (root.opened) Qt.callLater(root.maybeStartOcr)
 
   Component.onCompleted: initProc.running = true
 
-  // ------------------------------------------------------------ capture
-
   ListModel { id: displayModel }
 
-  PointerMoveGate { id: pointerGate; referenceItem: card }
-
-  // User settings live on this plugin's entry in shell.json (hot-reloads):
-  // { "id": "alanfortlink.clipboard", "historyLimit": 1500, "maxAgeDays": 30, "maxRows": 200 }
-  FileView {
-    id: shellConfigFile
-    path: Quickshell.env("HOME") + "/.config/omarchy/shell.json"
-    watchChanges: true
-    printErrors: false
-    onLoaded: root.applySettings(text())
-    onLoadFailed: root.applySettings("{}")
-    onFileChanged: reload()
-  }
-
-  // Missing-helper state surfaced IN the picker: banner with the exact
-  // command and a "Run in terminal" button. Nothing launches on its own.
-  property bool depsChecked: false
-  property var missingDeps: [] // [{ name, packages }]
-  function checkDeps() {
-    if (root.depsChecked || depsProc.running) return
-    root.depsChecked = true
-    var checks = [
-      "python3|Clipboard capture|python3",
-      "jq|Paste and open actions|jq",
-      "wl-copy|Clipboard access|wl-clipboard",
-      "wtype|Paste into the active window|wtype"
-    ]
-    if (root.qrDecode) checks.push("zbarimg|QR decode|zbar")
-    if (root.ocr) checks.push("tesseract|OCR search|tesseract tesseract-data-eng")
-    var script = ""
-    for (var i = 0; i < checks.length; i++) {
-      var fields = checks[i].split("|")
-      script += "command -v " + fields[0] + " >/dev/null 2>&1 || printf '%s\\n' '" + checks[i] + "';"
-    }
-    depsProc.command = ["bash", "-c", script]
-    depsProc.running = true
-  }
-
-  function depResult(output) {
-    var missing = []
-    var lines = String(output || "").trim().split("\n")
-    for (var i = 0; i < lines.length; i++) {
-      if (!lines[i]) continue
-      var fields = lines[i].split("|")
-      if (fields.length === 3)
-        missing.push({ name: fields[1], packages: fields[2] })
-    }
-    root.missingDeps = missing
-  }
-
-  function missingDependencyCommand() {
-    var packages = []
-    for (var i = 0; i < root.missingDeps.length; i++) {
-      var names = root.missingDeps[i].packages.split(" ")
-      for (var j = 0; j < names.length; j++)
-        if (packages.indexOf(names[j]) === -1) packages.push(names[j])
-    }
-    return packages.length ? "omarchy pkg add " + packages.join(" ") : ""
-  }
-
-  function applySettings(raw) {
-    var s = Store.parseSettings(raw, "alanfortlink.clipboard")
-    var needsWatchRestart = s.qrDecode !== root.qrDecode || s.ocr !== root.ocr
-      || s.ocrLang !== root.ocrLang
-    root.historyLimit = s.historyLimit
-    root.maxAgeDays = s.maxAgeDays
-    root.displayLimit = s.maxRows
-    root.qrDecode = s.qrDecode
-    root.ocr = s.ocr
-    root.ocrLang = s.ocrLang
-    // The watchers read qr/ocr settings from the environment — restart them
-    // so changes take effect without a shell reload.
-    if (needsWatchRestart && watchProc.running) {
-      watchProc.running = false
-      watchRestartTimer.restart()
-    }
-    root.applyRetentionPolicy()
-    root.checkDeps()
-    if (root.opened) root.rebuild()
-  }
-
-  // Pause state survives shell restarts.
-  FileView {
-    id: pausedFile
-    path: Quickshell.env("HOME") + "/.local/state/omarchy/clipboard-paused.json"
-    watchChanges: true
-    atomicWrites: true
-    printErrors: false
-    onLoaded: {
-      try { root.paused = !!JSON.parse(text()).paused } catch (e) { root.paused = false }
-    }
-    onLoadFailed: root.paused = false
+  PointerMoveGate {
+    id: pointerGate
+    referenceItem: card
   }
 
   FileView {
     id: historyFile
-    path: root.statePath
+    path: root.historyPath
     watchChanges: true
     atomicWrites: true
     printErrors: false
@@ -440,45 +445,55 @@ Item {
     onFileChanged: reload()
   }
 
-  Process {
-    id: depsProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.depResult(text)
-    }
-  }
-  Process {
-    id: gcProc
-    onExited: runNextGc()
-  }
-
-  // Reap watchers left behind by a previous shell instance, then start our
-  // own. pdeathsig kills them whenever the shell exits.
+  // Reap watchers left behind by a previous shell instance (ours or the
+  // built-in's), then start our own. pdeathsig ties them to the shell.
   Process {
     id: initProc
-    command: ["pkill", "-f", "wl-paste .*--watch .*capture\\.py"]
+    command: ["pkill", "-f", "wl-paste .*--watch .*/clipboard/capture\\.sh"]
     onExited: {
-      snapshotProc.running = true
-      watchProc.running = true
+      currentProc.running = true
+      textWatchProc.running = true
+      imageWatchProc.running = true
+      ocrCheckProc.running = true
     }
   }
 
   Process {
-    id: snapshotProc
-    command: ["python3", root.pluginDir + "/capture.py"]
+    id: ocrCheckProc
+    command: ["sh", "-c", "command -v tesseract >/dev/null"]
+    onExited: function(code) { root.ocrAvailable = code === 0 }
+  }
+
+  Process {
+    id: ocrProc
+    command: ["timeout", "20s", "tesseract", root.ocrPath, "stdout"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.finishOcr(root.ocrPath, text)
+    }
+  }
+
+  Process {
+    id: currentProc
+    command: [root.captureScript]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.addClipboardJson(text)
+    }
+  }
+
+  Process {
+    id: textWatchProc
+    command: ["setpriv", "--pdeathsig", "TERM", "wl-paste", "--type", "text", "--watch", root.captureScript, "text"]
+    onExited: watchRestartTimer.restart()
     stdout: SplitParser {
       onRead: function(data) { root.addClipboardJson(data) }
     }
   }
 
   Process {
-    id: watchProc
-    command: ["setpriv", "--pdeathsig", "TERM", "wl-paste", "--watch", "python3", root.pluginDir + "/capture.py", "watch"]
-    environment: ({
-      "CLIPBOARD_QR": root.qrDecode ? "1" : "0",
-      "CLIPBOARD_OCR": root.ocr ? "1" : "0",
-      "CLIPBOARD_OCR_LANG": root.ocrLang
-    })
+    id: imageWatchProc
+    command: ["setpriv", "--pdeathsig", "TERM", "wl-paste", "--type", "image/png", "--watch", root.captureScript, "image/png"]
     onExited: watchRestartTimer.restart()
     stdout: SplitParser {
       onRead: function(data) { root.addClipboardJson(data) }
@@ -489,46 +504,81 @@ Item {
     id: watchRestartTimer
     interval: 1000
     repeat: false
-    onTriggered: if (!watchProc.running) watchProc.running = true
+    onTriggered: {
+      if (!textWatchProc.running) textWatchProc.running = true
+      if (!imageWatchProc.running) imageWatchProc.running = true
+    }
   }
 
-  // Cursor blink
-  Timer {
-    running: root.opened
-    interval: 530
-    repeat: true
-    onTriggered: root.cursorVisible = !root.cursorVisible
+  // ------------------------------------------------------------ reusable looks
+
+  // Every pane is the same box: hairline border, soft fill, shared radius.
+  component Box: Rectangle {
+    radius: root.boxRadius
+    color: Util.alpha(root.foreground, 0.025)
+    border.width: Style.normalBorderWidth
+    border.color: root.lineColor
+  }
+
+  component Chip: Rectangle {
+    property string label: ""
+    width: chipLabel.implicitWidth + Style.space(10)
+    height: chipLabel.implicitHeight + Style.space(4)
+    radius: Math.max(2, root.cornerRadius / 3)
+    color: root.chipBg
+
+    Text {
+      id: chipLabel
+      textFormat: Text.PlainText
+      anchors.centerIn: parent
+      text: parent.label
+      color: root.foreground
+      opacity: 0.85
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+  }
+
+  function rowIcon(entryType, category) {
+    if (entryType === "image") return "󰋩"
+    if (entryType === "file") return "󰈔"
+    if (category === "links") return "󰌷"
+    return "󰈙"
   }
 
   // ------------------------------------------------------------ window
 
-  // Small floating card — no fullscreen surface or scrim.
-  PanelWindow {
+  OverlayWindow {
     id: panel
-    visible: root.opened
-    implicitWidth: root.cardWidth
-    implicitHeight: root.cardHeight
-    color: "transparent"
-    WlrLayershell.namespace: "alanfortlink-clipboard"
-    WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
-    exclusionMode: ExclusionMode.Ignore
+    shown: root.opened
+    WlrLayershell.namespace: "omarchy-clipboard"
+
+    Rectangle {
+      anchors.fill: parent
+      color: root.scrim
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      onClicked: root.close()
+    }
 
     BorderSurface {
       id: card
-      anchors.fill: parent
+      width: root.cardWidth
+      height: root.cardHeight
       radius: root.cornerRadius
+      anchors.centerIn: parent
       color: root.background
       borderSpec: root.borderSpec
       padding: root.contentMargin
 
-      MouseArea { anchors.fill: parent; onClicked: function() {} }
+      MouseArea { anchors.fill: parent; onClicked: {} }
 
       Item {
         id: keyCatcher
         anchors.fill: parent
         z: root.clearConfirmOpen ? 20 : 0
-        focus: true
 
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function(event) {
@@ -537,66 +587,79 @@ Item {
             return
           }
 
+          var ctrl = event.modifiers & Qt.ControlModifier
+          var shift = event.modifiers & Qt.ShiftModifier
+          var alt = event.modifiers & Qt.AltModifier
+
           if (event.key === Qt.Key_Escape) {
-            if (root.filterText) root.setFilter("")
-            else if (root.typeFilter) root.setTypeFilter("")
+            if (root.filterText) { filterInput.text = ""; root.setFilter("") }
             else root.close()
             event.accepted = true
-          } else if (Util.editsFilter(event, root.filterText)) {
-            root.setFilter(Util.editedFilter(event, root.filterText))
+          } else if (event.key === Qt.Key_U && event.modifiers === Qt.ControlModifier) {
+            filterInput.text = ""
+            root.setFilter("")
             event.accepted = true
           } else if (event.key === Qt.Key_Delete) {
-            if (event.modifiers & Qt.ShiftModifier) root.requestClearHistory()
-            else root.removeIndex(root.selectedIndex)
+            if (shift) root.requestClearHistory()
+            else if (ctrl) root.requestDeletePinned(root.selectedIndex)
+            else root.removeDisplayIndex(root.selectedIndex)
             event.accepted = true
-          } else if (event.key === Qt.Key_Up || (event.key === Qt.Key_P && (event.modifiers & Qt.ControlModifier))) {
+          } else if (event.key === Qt.Key_Backtab || (event.key === Qt.Key_Tab && shift)) {
+            root.requestUnpinAll()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Tab) {
+            if (root.cursorActive) root.togglePinIndex(root.selectedIndex)
+            event.accepted = true
+          } else if (event.key === Qt.Key_Left) {
+            root.cycleCategory(-1)
+            event.accepted = true
+          } else if (event.key === Qt.Key_Right) {
+            root.cycleCategory(1)
+            event.accepted = true
+          } else if (event.key === Qt.Key_Up || (ctrl && event.key === Qt.Key_P)) {
             root.select(-1)
             event.accepted = true
-          } else if (event.key === Qt.Key_Down || (event.key === Qt.Key_N && (event.modifiers & Qt.ControlModifier))) {
+          } else if (event.key === Qt.Key_Down || (ctrl && event.key === Qt.Key_N)) {
             root.select(1)
             event.accepted = true
           } else if (event.key === Qt.Key_PageUp) {
-            root.select(-8)
+            root.select(-6)
             event.accepted = true
           } else if (event.key === Qt.Key_PageDown) {
-            root.select(8)
+            root.select(6)
             event.accepted = true
-          } else if (event.key === Qt.Key_Home) {
+          } else if (event.key === Qt.Key_Home && ctrl) {
             root.selectAbsolute(0)
             event.accepted = true
-          } else if (event.key === Qt.Key_End) {
-            root.selectAbsolute(root.results.length - 1)
+          } else if (event.key === Qt.Key_End && ctrl) {
+            root.selectAbsolute(displayModel.count - 1)
             event.accepted = true
-          } else if (event.key === Qt.Key_Tab) {
-            root.togglePinIndex(root.selectedIndex)
+          } else if (ctrl && event.key === Qt.Key_O) {
+            if (root.cursorActive) root.openSelected(root.rowAt(root.selectedIndex))
             event.accepted = true
-          } else if (event.key === Qt.Key_Equal && (event.modifiers & Qt.ControlModifier)) {
-            root.pause(JSON.stringify({ paused: "toggle" }))
+          } else if (ctrl && shift && event.key === Qt.Key_P) {
+            if (root.cursorActive) root.copyPathOf(root.rowAt(root.selectedIndex))
             event.accepted = true
-          } else if (event.key === Qt.Key_O && (event.modifiers & Qt.ControlModifier)) {
-            root.openResult(root.currentResult)
-            event.accepted = true
-          } else if (event.key === Qt.Key_C && (event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier)) {
-            root.copyText(root.textContent(root.currentResult))
+          } else if (ctrl && shift && event.key === Qt.Key_C) {
+            if (root.cursorActive) root.copyTextOf(root.rowAt(root.selectedIndex))
             event.accepted = true
           } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-            if (event.modifiers & Qt.ShiftModifier) root.copyResult(root.currentResult)
-            else if (event.modifiers & Qt.AltModifier) root.openResult(root.currentResult)
-            else root.pasteResult(root.currentResult)
-            event.accepted = true
-          } else if (event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127) {
-            root.setFilter(root.filterText + event.text)
+            if (root.cursorActive && alt) root.openSelected(root.rowAt(root.selectedIndex))
+            else if (root.cursorActive && shift) root.copySelected(root.rowAt(root.selectedIndex))
+            else if (root.cursorActive) root.applySelected(root.rowAt(root.selectedIndex))
+            else if (displayModel.count > 0) root.cursorActive = true
             event.accepted = true
           }
         }
 
         ConfirmDialog {
           id: clearConfirm
+
           anchors.fill: parent
           opened: root.clearConfirmOpen
           z: 10
-          message: "Delete entire clipboard history?"
-          confirmText: "Delete"
+          message: root.confirmMessage()
+          confirmText: root.confirmLabel()
           background: root.background
           foreground: root.foreground
           scrim: root.scrim
@@ -609,192 +672,121 @@ Item {
         }
       }
 
-      // ---------------------------------------------------------- layout
-
       Column {
         anchors.fill: parent
         anchors.topMargin: card.contentTopInset
         anchors.rightMargin: card.contentRightInset
         anchors.bottomMargin: card.contentBottomInset
         anchors.leftMargin: card.contentLeftInset
-        spacing: Style.space(10)
+        spacing: root.contentSpacing
 
-        // ---- search bar
-        Item {
+        // ---- search box
+        Box {
           width: parent.width
-          height: root.headerHeight
-
-          Text {
-            id: searchIcon
-            anchors.left: parent.left
-            anchors.verticalCenter: parent.verticalCenter
-            text: "󰍛"
-            color: root.accent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.heading
-          }
+          height: root.searchHeight
 
           Row {
-            anchors.left: searchIcon.right
-            anchors.leftMargin: Style.space(10)
-            anchors.right: countLabel.left
-            anchors.rightMargin: Style.space(10)
-            anchors.verticalCenter: parent.verticalCenter
-            spacing: Style.space(2)
+            anchors.fill: parent
+            anchors.leftMargin: Style.space(12)
+            anchors.rightMargin: Style.space(12)
+            spacing: Style.space(10)
 
             Text {
-              id: searchText
-              width: Math.min(implicitWidth, parent.width - Style.space(6))
-              text: root.filterText || "Search clipboard\u2026   (type:image  app:firefox  <2h  is:pinned)"
+              textFormat: Text.PlainText
+              anchors.verticalCenter: parent.verticalCenter
+              text: "󰍉"
               color: root.foreground
-              opacity: root.filterText.length > 0 ? 1 : 0.4
+              opacity: root.filterText ? 0.9 : 0.5
               font.family: root.fontFamily
               font.pixelSize: Style.font.heading
-              elide: Text.ElideRight
-              maximumLineCount: 1
             }
 
-            Rectangle {
+            Item {
+              width: parent.width - Style.space(10) * 2 - Style.space(20) - countChip.width
+              height: parent.height
+
+              FilterInput {
+                id: filterInput
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                keyHandler: keyCatcher
+                readOnly: root.clearConfirmOpen
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.heading
+                onTextChanged: if (text !== root.filterText) root.setFilter(text)
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                anchors.fill: filterInput
+                verticalAlignment: Text.AlignVCenter
+                visible: !root.filterText && !filterInput.preeditText
+                text: Commons.I18n.t("clipboard.search")
+                color: root.foreground
+                opacity: 0.45
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.heading
+                elide: Text.ElideRight
+              }
+            }
+
+            Chip {
+              id: countChip
               anchors.verticalCenter: parent.verticalCenter
-              width: Math.max(1, Style.space(2))
-              height: Style.font.heading
-              color: root.accent
-              visible: root.cursorVisible && root.cursorActive
+              visible: displayModel.count > 0
+              label: Commons.I18n.formatNumber(displayModel.count)
             }
-          }
-
-          Text {
-            id: countLabel
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            text: {
-              if (root.paused) return "⏸ paused"
-              var shown = root.results.length
-              var total = root.history.length
-              if (shown === total) return total + " items"
-              return shown + " of " + total
-            }
-            color: root.mutedFg
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
           }
         }
 
-        // ---- type chips
+        // ---- category tabs
         Row {
-          id: chipsRow
+          id: categoryRow
           width: parent.width
-          spacing: Style.space(6)
+          height: root.tabsHeight
+          spacing: Style.space(18)
 
           Repeater {
-            model: [
-              { key: "", label: "All" },
-              { key: "text", label: "󰈙 Text" },
-              { key: "link", label: "󰌹 Links" },
-              { key: "image", label: "󰋲 Images" },
-              { key: "files", label: "󰉋 Files" },
-              { key: "code", label: "󰅴 Code" },
-              { key: "json", label: "󰘦 JSON" },
-              { key: "color", label: "󰏘 Colors" },
-              { key: "pinned", label: "★ Pinned" }
-            ]
+            model: ClipboardHistory.categories
 
-            delegate: Rectangle {
-              required property var modelData
-              property string chipKey: modelData.key
-              property string chipLabel: modelData.label
-              property bool active: root.typeFilter === chipKey
+            Item {
+              id: tab
+              required property string modelData
+              readonly property bool active: root.category === modelData
 
-              radius: height / 2
-              color: active ? Util.alpha(root.accent, 0.18) : root.chipBg
-              width: chipLabel_.implicitWidth + Style.space(16)
-              height: Style.space(22)
+              width: tabLabel.implicitWidth
+              height: categoryRow.height
 
               Text {
-                id: chipLabel_
+                id: tabLabel
+                textFormat: Text.PlainText
                 anchors.centerIn: parent
-                text: modelData.label
-                color: parent.active ? root.accent : root.mutedFg
+                text: ClipboardHistory.categoryLabel(tab.modelData, Commons.I18n.t)
+                color: tab.active ? root.selectedText : root.foreground
+                opacity: tab.active ? 1 : 0.5
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
+                font.bold: tab.active
               }
 
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.setTypeFilter(parent.chipKey)
-              }
-            }
-          }
-        }
-
-        // ---- paused banner
-        Rectangle {
-          width: parent.width
-          height: root.paused ? Style.space(24) : 0
-          visible: root.paused
-          radius: Style.cornerRadius
-          color: Util.alpha(Color.urgent, 0.15)
-
-          Text {
-            anchors.centerIn: parent
-            text: "⏸ Paused — new copies are not being recorded   ·   Ctrl+= to resume"
-            color: Color.urgent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-        }
-
-        // ---- missing-dependency banner: command + run-in-terminal button
-        Rectangle {
-          width: parent.width
-          height: root.missingDeps.length > 0 ? Style.space(24) : 0
-          visible: root.missingDeps.length > 0
-          radius: Style.cornerRadius
-          color: Util.alpha(Color.urgent, 0.15)
-
-          Row {
-            anchors.centerIn: parent
-            spacing: Style.space(8)
-
-            Text {
-              anchors.verticalCenter: parent.verticalCenter
-              text: root.missingDeps.length > 0
-                    ? root.missingDeps[0].name + " unavailable — run: " + root.missingDependencyCommand()
-                    : ""
-              color: Color.urgent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-
-            Rectangle {
-              anchors.verticalCenter: parent.verticalCenter
-              radius: height / 2
-              color: Util.alpha(Color.accent, 0.2)
-              width: runLabel.implicitWidth + Style.space(14)
-              height: Style.space(18)
-              visible: root.missingDeps.length > 0
-
-              Text {
-                id: runLabel
-                anchors.centerIn: parent
-                text: "▶ Run in terminal"
-                color: root.accent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
+              Rectangle {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                height: Math.max(1, Style.space(2))
+                radius: height / 2
+                color: root.selectedText
+                visible: tab.active
               }
 
               MouseArea {
                 anchors.fill: parent
                 cursorShape: Qt.PointingHandCursor
                 onClicked: {
-                  if (root.missingDeps.length === 0) return
-                  root.close()
-                  var cmd = root.missingDependencyCommand()
-                  if (!cmd) return
-                  cmd += '; echo; echo "Done — press Enter to close"; read'
-                  Quickshell.execDetached(["omarchy-launch-terminal", "bash", "-c", cmd])
+                  root.setCategory(tab.modelData)
+                  filterInput.forceActiveFocus()
                 }
               }
             }
@@ -804,231 +796,252 @@ Item {
         // ---- list + preview
         Item {
           width: parent.width
-          height: parent.height - root.headerHeight - chipsRow.height
-                  - (root.paused ? Style.space(24) + Style.space(10) : 0)
-                  - (root.missingDeps.length > 0 ? Style.space(24) + Style.space(10) : 0)
-                  - footer.height - Style.space(30)
+          height: parent.height - root.searchHeight - root.tabsHeight - root.footerHeight - root.contentSpacing * 3
 
-          ListView {
-            id: resultList
-            anchors.top: parent.top
-            anchors.bottom: parent.bottom
-            anchors.left: parent.left
-            width: root.listWidth
-            model: displayModel
-            clip: true
-            spacing: Style.space(3)
-            boundsBehavior: Flickable.StopAtBounds
+          Row {
+            anchors.fill: parent
+            spacing: root.contentSpacing
 
-            delegate: Rectangle {
-              id: row
-              required property int index
-              required property var row_    // results[i]: { row, score, positions }
-              required property string derived
-              required property string titleHtml
-              required property string subtitle
+            Box {
+              id: listBox
+              width: Math.round(parent.width * 0.44)
+              height: parent.height
+              clip: true
 
-              readonly property bool hasCursor: root.cursorActive && index === root.selectedIndex
-              readonly property var entry: row_ ? row_.row.entry : null
-
-              width: resultList.width
-              height: root.rowHeight
-              radius: root.cornerRadius
-              color: hasCursor ? root.selectedBackground : "transparent"
-
-              Row {
+              ListView {
+                id: resultList
                 anchors.fill: parent
-                anchors.leftMargin: Style.space(10)
-                anchors.rightMargin: Style.space(10)
-                spacing: Style.space(10)
+                anchors.margins: Style.space(6)
+                model: displayModel
+                clip: true
+                spacing: Style.space(2)
+                boundsBehavior: Flickable.StopAtBounds
 
-                // thumbnail for images, glyph tile otherwise
-                Rectangle {
-                  width: Style.space(36)
-                  height: Style.space(36)
-                  radius: Style.space(6)
-                  color: root.chipBg
-                  anchors.verticalCenter: parent.verticalCenter
-                  clip: true
+                section.property: "section"
+                section.criteria: ViewSection.FullString
+                section.delegate: Item {
+                  required property string section
+                  readonly property bool isPins: section === "pinned"
+                  readonly property bool shown: isPins || (root.pinnedCount > 0 && root.pinnedCount < displayModel.count)
 
-                  Image {
-                    anchors.fill: parent
-                    visible: row.derived === "image"
-                    source: row.entry && row.entry.path ? Util.fileUrl(row.entry.path) : ""
-                    fillMode: Image.PreserveAspectCrop
-                    asynchronous: true
-                    smooth: true
-                    sourceSize.width: 72
-                    sourceSize.height: 72
-                  }
+                  width: ListView.view.width
+                  height: shown ? root.sectionHeight : 0
+                  visible: shown
 
                   Text {
-                    anchors.centerIn: parent
-                    visible: row.derived !== "image"
-                    text: Classify.typeIcon(row.derived)
-                    color: root.foreground
-                    opacity: 0.85
+                    visible: parent.isPins
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(12)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "󰐃"
+                    color: root.selectedText
+                    opacity: 0.8
                     font.family: root.fontFamily
-                    font.pixelSize: Style.font.iconLarge
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Rectangle {
+                    visible: !parent.isPins
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.leftMargin: Style.space(8)
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    height: Style.spacing.hairline
+                    color: root.lineColor
                   }
                 }
 
-                Column {
-                  width: parent.width - Style.space(46) - pinMark.width
-                  anchors.verticalCenter: parent.verticalCenter
-                  spacing: Style.space(2)
+                delegate: Rectangle {
+                  id: row
+                  required property int index
+                  required property bool pinned
+                  required property string entryType
+                  required property string category
+                  required property string previewText
+                  required property string previewImage
 
-                  Text {
-                    width: parent.width
-                    text: row.titleHtml
-                    textFormat: Text.StyledText
-                    color: row.hasCursor ? root.selectedText : root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                    elide: Text.ElideRight
-                    maximumLineCount: 1
+                  readonly property bool hasCursor: root.cursorActive && index === root.selectedIndex
+                  readonly property int thumb: height - Style.space(12)
+
+                  width: ListView.view.width
+                  height: root.rowHeight
+                  radius: root.boxRadius
+                  color: hasCursor ? root.selectedBackground : "transparent"
+
+                  Row {
+                    anchors.fill: parent
+                    anchors.leftMargin: Style.space(10)
+                    anchors.rightMargin: Style.space(10)
+                    spacing: Style.space(10)
+
+                    // Thumbnail for images, type glyph otherwise: same slot.
+                    Item {
+                      width: row.thumb
+                      height: parent.height
+
+                      Rectangle {
+                        visible: row.previewImage.length > 0
+                        anchors.centerIn: parent
+                        width: row.thumb
+                        height: row.thumb
+                        radius: Math.max(2, root.boxRadius / 2)
+                        color: Util.alpha(root.foreground, 0.05)
+                        border.width: Style.normalBorderWidth
+                        border.color: root.lineColor
+                        clip: true
+
+                        SizedImage {
+                          anchors.fill: parent
+                          anchors.margins: 1
+                          url: row.previewImage
+                          crop: true
+                          asynchronous: true
+                          smooth: true
+                        }
+                      }
+
+                      Text {
+                        visible: row.previewImage.length === 0
+                        anchors.centerIn: parent
+                        textFormat: Text.PlainText
+                        text: root.rowIcon(row.entryType, row.category)
+                        color: row.hasCursor ? root.selectedText : root.foreground
+                        opacity: row.hasCursor ? 0.9 : 0.5
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.title
+                      }
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      width: parent.width - row.thumb - parent.spacing - (pinGlyph.visible ? pinGlyph.width + parent.spacing : 0)
+                      height: parent.height
+                      text: row.previewText
+                      color: row.hasCursor ? root.selectedText : root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      opacity: row.entryType === "image" ? 0.75 : 1.0
+                      elide: Text.ElideRight
+                      wrapMode: Text.NoWrap
+                      verticalAlignment: Text.AlignVCenter
+                    }
+
+                    Text {
+                      id: pinGlyph
+                      visible: row.pinned
+                      anchors.verticalCenter: parent.verticalCenter
+                      textFormat: Text.PlainText
+                      text: "󰐃"
+                      color: root.selectedText
+                      opacity: 0.7
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
                   }
 
-                  Text {
-                    width: parent.width
-                    text: row.subtitle
-                    color: root.mutedFg
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    elide: Text.ElideRight
-                    maximumLineCount: 1
+                  MouseArea {
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onPositionChanged: function(mouse) {
+                      root.selectFromPointer(row.index, row, mouse)
+                    }
+                    onClicked: {
+                      root.cursorActive = true
+                      root.selectedIndex = row.index
+                      root.activateFromPointer(row.index)
+                    }
                   }
+                }
+              }
+
+              // Empty state
+              Column {
+                anchors.centerIn: parent
+                width: parent.width - Style.space(32)
+                spacing: Style.space(8)
+                visible: displayModel.count === 0
+
+                Text {
+                  text: "󰅌"
+                  color: root.selectedText
+                  opacity: 0.8
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.displayLarge
+                  anchors.horizontalCenter: parent.horizontalCenter
                 }
 
                 Text {
-                  id: pinMark
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: "★"
-                  visible: row.entry && row.entry.pinned ? true : false
-                  color: root.accent
+                  textFormat: Text.PlainText
+                  text: root.history.length === 0 ? Commons.I18n.t("clipboard.empty") : Commons.I18n.t("common.noMatchesFor").arg(root.filterText || ClipboardHistory.categoryLabel(root.category, Commons.I18n.t))
+                  color: root.foreground
+                  opacity: 0.7
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
+                  horizontalAlignment: Text.AlignHCenter
+                  width: parent.width
+                  elide: Text.ElideRight
                 }
               }
+            }
 
-              MouseArea {
+            Box {
+              width: parent.width - listBox.width - parent.spacing
+              height: parent.height
+              clip: true
+
+              PreviewPane {
                 anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onPositionChanged: function(mouse) { root.selectFromPointer(row.index, row, mouse) }
-                // A stray click must never paste into the window behind the
-                // picker: single click selects, double click activates.
-                onClicked: function(mouse) {
-                  root.cursorActive = true
-                  root.selectedIndex = row.index
-                  if (mouse.clickCount === 2) root.pasteResult(root.currentResult)
-                }
-                onDoubleClicked: root.pasteResult(root.currentResult)
+                row: root.currentRow
+                ocrBusy: ocrProc.running && root.currentRow && root.ocrPath === root.currentRow.path
+                ocrAvailable: root.ocrAvailable
+                foreground: root.foreground
+                lineColor: root.lineColor
+                chipBg: root.chipBg
+                selectedText: root.selectedText
+                fontFamily: root.fontFamily
+                cornerRadius: root.boxRadius
+                pad: Style.space(12)
+                onOpenLink: root.openSelected(root.currentRow)
+                onCopyText: function(text) { root.copyPlain(text) }
               }
-            }
-          }
-
-          // divider between list and preview
-          Rectangle {
-            anchors.top: parent.top
-            anchors.bottom: parent.bottom
-            anchors.left: parent.left
-            anchors.leftMargin: root.listWidth + Style.space(6)
-            width: Style.normalBorderWidth
-            color: root.lineColor
-          }
-
-          PreviewPane {
-            anchors.top: parent.top
-            anchors.bottom: parent.bottom
-            anchors.right: parent.right
-            anchors.left: parent.left
-            anchors.leftMargin: root.listWidth + Style.space(14)
-            result: root.currentResult
-            openAction: function() { root.openResult(root.currentResult) }
-            copyTextAction: function(text) { root.copyText(text) }
-            pluginDir: root.pluginDir
-            visible: root.currentResult !== null
-          }
-
-          // empty state
-          Column {
-            anchors.centerIn: parent
-            spacing: Style.space(8)
-            visible: displayModel.count === 0
-
-            Text {
-              text: "󰅌"
-              color: root.selectedText
-              opacity: 0.8
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.displayLarge
-              horizontalAlignment: Text.AlignHCenter
-              width: parent.width
-            }
-
-            Text {
-              text: root.history.length === 0
-                    ? "Clipboard is empty — copy something first"
-                    : "No matches for “" + root.filterText + "”"
-              color: root.foreground
-              opacity: 0.7
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.title
-              horizontalAlignment: Text.AlignHCenter
-              width: parent.width
             }
           }
         }
 
-        // ---- footer key hints
-        Row {
-          id: footer
+        // ---- footer: contextual key hints
+        Item {
           width: parent.width
-          spacing: Style.space(10)
+          height: root.footerHeight
+          clip: true
 
-          Repeater {
-            model: [
-              { keys: "ctrl+n/p", hint: "navigate" },
-              { keys: "enter", hint: "paste" },
-              { keys: "shift+enter", hint: "copy" },
-              { keys: "ctrl+o", hint: "open" },
-              { keys: "ctrl+shift+c", hint: "copy text" },
-              { keys: "tab", hint: "pin" },
-              { keys: "ctrl+=", hint: "pause" },
-              { keys: "del", hint: "remove" },
-              { keys: "esc", hint: "close" }
-            ]
+          Row {
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(12)
 
-            delegate: Row {
-              required property var modelData
-              spacing: Style.space(4)
+            Repeater {
+              model: root.footerHints()
 
-              Rectangle {
-                radius: Style.space(3)
-                color: root.chipBg
-                width: keyText.implicitWidth + Style.space(10)
-                height: Style.space(18)
-                anchors.verticalCenter: parent.verticalCenter
+              Row {
+                required property var modelData
+                spacing: Style.space(5)
+
+                Chip {
+                  anchors.verticalCenter: parent.verticalCenter
+                  label: modelData[0]
+                }
 
                 Text {
-                  id: keyText
-                  anchors.centerIn: parent
-                  text: modelData.keys
-                  color: root.mutedFg
+                  textFormat: Text.PlainText
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: modelData[1]
+                  color: root.foreground
+                  opacity: 0.55
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                 }
               }
-
-              Text {
-                text: modelData.hint
-                color: root.mutedFg
-                opacity: 0.7
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                anchors.verticalCenter: parent.verticalCenter
-              }
             }
           }
         }
@@ -1036,58 +1049,21 @@ Item {
     }
   }
 
-  // ------------------------------------------------------------ display model
-
-  // results → displayModel rows. Wrapped in function so it can be called from
-  // rebuild(); title/subtitle strings precomputed here, not in delegates.
-  function syncDisplayModel() {
-    displayModel.clear()
-    for (var i = 0; i < root.results.length; i++) {
-      var r = root.results[i]
-      var e = r.row.entry
-      var derived = r.row.type
-      var titleHtml = ""
-      var subtitleParts = []
-
-      if (e.type === "image") {
-        if (e.qr) {
-          titleHtml = Fuzzy.escapeHtml(Classify.firstLine(e.qr, 60))
-          subtitleParts.push("QR")
-          if (e.mime) subtitleParts.push(e.mime.replace("image/", "").toUpperCase())
-        } else {
-          titleHtml = "Image" + (e.mime ? " · " + e.mime.replace("image/", "").toUpperCase() : "")
-          if (e.w && e.h) titleHtml += " · " + e.w + "×" + e.h
-          subtitleParts.push(Classify.formatBytes(r.row.bytes))
-        }
-      } else if (e.type === "files") {
-        var base = Classify.fileBase(e.paths[0])
-        titleHtml = Fuzzy.escapeHtml(e.paths.length > 1 ? base + "  +" + (e.paths.length - 1) + " more" : base)
-        subtitleParts.push(Classify.fileDir(e.paths[0]))
-      } else {
-        titleHtml = Fuzzy.highlightFirstLine(e.text, r.positions, "<b><font color=\"" + root.accentHex() + "\">", "</font></b>")
-        var st = Classify.textStats(e.text)
-        if (st.words > 0) subtitleParts.push(Classify.plural(st.words, "word"))
-      }
-
-      subtitleParts.push(Classify.typeLabel(derived))
-      if (e.type === "image" && e.qr) subtitleParts.pop() // "QR" badge already says it
-      if (r.row.app) subtitleParts.push(Classify.prettyApp(r.row.app))
-      if (r.row.ts) subtitleParts.push(Classify.formatAge(r.row.ts, Math.floor(Date.now() / 1000)))
-
-      displayModel.append({
-        row_: r,
-        derived: derived,
-        titleHtml: titleHtml,
-        subtitle: subtitleParts.join("  ·  ")
-      })
+  // Single click selects; a second click on the selected row pastes.
+  property int lastClickedIndex: -1
+  function activateFromPointer(index) {
+    if (root.lastClickedIndex === index) {
+      root.lastClickedIndex = -1
+      root.applySelected(root.rowAt(index))
+    } else {
+      root.lastClickedIndex = index
+      clickResetTimer.restart()
     }
   }
 
-  // 6-digit hex for rich-text <font color> tags, whatever toString() returns.
-  function accentHex() {
-    var s = root.accent.toString()
-    return "#" + s.slice(-6)
+  Timer {
+    id: clickResetTimer
+    interval: 600
+    onTriggered: root.lastClickedIndex = -1
   }
-
-  onResultsChanged: syncDisplayModel()
 }

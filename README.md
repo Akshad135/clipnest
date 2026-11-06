@@ -1,224 +1,73 @@
-# clipboard-history
+# Clipboard
 
-A Raycast/vicinae-style clipboard history manager for [Omarchy](https://omarchy.org),
-built as an Omarchy shell plugin. Fuzzy search over everything (content, type,
-source app, date — even text inside QR codes), rich per-type previews, and
-full theme integration.
+Omarchy's clipboard manager, extended. Same history file, same capture flow,
+same paste scripts as the built-in `omarchy.clipboard`, plus:
 
-<p align="center">
-  <img src="docs/screenshots/picker.png" alt="clipboard-history picker showing a QR code with its decoded content" width="720">
-</p>
-
-## Highlights
-
-- **Fuzzy search over everything** — fzf-style matching across content, source
-  app, and type. Typed terms rank by relevance (exact/substring matches above
-  sparse subsequences, recency breaking ties); filter-only queries stay
-  newest-first. Query tokens:
-  - `type:image|link|text|files|code|json|color|email|html|number` (prefix match)
-  - `app:firefox` — fuzzy match on the source app
-  - `is:pinned`, `today`, `yesterday`, `week`, `<2h`, `>30s`, `<3d`
-- **Rich previews, per type** — images rendered inline, QR codes show their
-  decoded content, colors show a swatch with hex/rgb/hsl, links show the
-  domain, JSON is pretty-printed, file lists show paths — every preview with
-  metadata chips (app, date, words/lines, size, paste counts)
-- **QR codes** — copied QR images are decoded with `zbarimg`; the payload is
-  shown in the list, preview, and is searchable like any text clip — and if it
-  encodes a link, `Ctrl+O` (or the preview's "Open link" chip) opens it in the
-  browser directly
-- **OCR search** — captured images are OCR'd with `tesseract`, so text inside
-  screenshots becomes fuzzy-searchable; the recognized text shows in the
-  preview pane and as a metadata chip
-- **Rich capture** — a `wl-paste --watch` daemon records every clip with mime
-  type, byte size, source app (via `hyprctl`), timestamp, and image dimensions.
-  Text, images, and `file://` URI lists (file-manager copies) are supported;
-  password-manager clips and binary payloads are skipped
-- **Retention control** — configure how much and how long history is kept
-- **Pause/resume** — stop recording new copies without losing your history
-- **Fully theme-integrated** — colors, spacing, corner radius, borders, and
-  the monospace font all come from the Omarchy shell's theme singletons; it
-  re-themes itself on `omarchy theme set`
-
-<p align="center">
-  <img src="docs/screenshots/search.png" alt="fuzzy search for “omarchy” with highlighted matches" width="720">
-</p>
+- **Pins** — `Tab` pins an entry. Pins sit in their own section at the top,
+  survive the history cap and clear-all, and `Del` never touches them.
+- **Categories** — All / Text / Links / Images / Files tabs under the search
+  bar. `←` `→` cycles, or click.
+- **Previews per type** — images framed with their dimensions, links with
+  their domain and an open action, text with char/line/word counts, file lists
+  one path per row.
+- **OCR** — the first time an image is previewed, `tesseract` reads its text.
+  The text shows under the image, is copyable, and is searchable from then on.
+- **Key-hint footer** — only the keys that apply to the selected entry.
+- `Ctrl+N` / `Ctrl+P` navigation, `Ctrl+O` open, copy-path and copy-text.
 
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/alanfortlink/clipboard-history.git --enable
+omarchy plugin add https://github.com/Akshad135/real-clipboard.git --enable
 ```
 
-No separate dependency command is required during installation. The picker
-always opens; if a helper is missing, it shows the exact package command inside
-the window with a **Run in terminal** button.
-
-Already have images in history you'd like OCR'd? One-shot backfill:
+Omarchy routes its own clipboard shortcuts (`Super+Ctrl+V`, and any binding
+that targets `omarchy.clipboard`) to this plugin while it is enabled. Disable
+it to get the built-in back:
 
 ```bash
-python3 scripts/backfill-ocr.py          # add --lang deu for other languages
+omarchy plugin disable akshad135.clipboard
 ```
 
-That's the whole install — `omarchy plugin add` clones the repo, validates the
-manifest, and enables it. It replaces the built-in `omarchy.clipboard`
-(restore it later with `omarchy plugin disable alanfortlink.clipboard`).
-
-### File previews
-
-Copied files show their name, type, size, modification time, and path. Image
-and video files show a thumbnail and resolution; videos and audio show duration,
-and audio also shows codec, sample rate, and channels. PDFs show a first-page
-thumbnail and page information. Text and code files show the first 8 KiB.
-Folders and other files retain basic information. Use Previous/Next to inspect
-multiple copied files. Details load on selection, including for existing history.
-
-Media previews use optional `ffmpeg` (`ffprobe` included); PDF previews use
-optional `poppler` (`pdfinfo` and `pdftoppm`). Without them, basic file information
-still works. Preview commands have time and output limits, and media thumbnails
-are skipped above 40 megapixels. Missing or moved files show an error.
-
-### Dependencies
-
-All are regular Arch packages; nothing is downloaded or run at install time.
-Required: `wl-clipboard`, `jq`, `python3`, `wtype` (paste into the focused
-window). Optional: `zbar` (QR decoding) and `tesseract` (OCR search) — without
-them the picker still works and shows the `omarchy pkg add …` command to add them.
-No sudo or pkexec is required by the plugin itself.
-
-The clipboard owner is treated as untrusted. Payloads are streamed through a
-capped reader and dropped when they exceed 32 MiB (images) or 4 MiB (text), or
-take longer than 5 s to deliver; QR decoding and OCR only run on images under
-40 megapixels, as read from the file header without decoding. Override with
-`CLIPBOARD_MAX_IMAGE_BYTES`, `CLIPBOARD_MAX_TEXT_BYTES`, and
-`CLIPBOARD_MAX_PARSE_PIXELS` in the shell's environment.
-
-Omarchy's default `Super+Ctrl+V` routes to it via the clone mechanism. An
-existing `Super+Shift+V` binding targeting `omarchy.clipboard` routes to it too.
-For a custom binding, edit the **live** config —
-`~/.config/hypr/bindings.lua` on Quattro (a plain `bindings.conf` may exist
-but is not sourced):
-
-```lua
-o.bind("SUPER + SHIFT + V", "Clipboard manager",
-  "omarchy-shell shell toggle omarchy.clipboard")
-```
-
-(If your config is still legacy `bindings.conf`: `bindd = ALT SHIFT, V, …`.)
-
-Updating: `omarchy plugin update alanfortlink.clipboard` · Uninstall: `omarchy plugin remove alanfortlink.clipboard`
-
-### Upgrading from a pre-1.0 install
-
-If you installed an earlier build (plugin id `tank.clipboard`, or a symlinked
-checkout via `install.sh`), remove it, reinstall from git, and repair any direct
-shortcut bindings so they target Omarchy's clone-aware `omarchy.clipboard` id:
-
-```bash
-omarchy plugin remove tank.clipboard --yes   # or: alanfortlink.clipboard
-omarchy plugin add https://github.com/alanfortlink/clipboard-history.git --enable --yes
-bash ~/.config/omarchy/plugins/alanfortlink.clipboard/scripts/configure-bindings.sh
-omarchy restart shell
-```
-
-History data is preserved. `configure-bindings.sh` edits `bindings.lua` (or
-`bindings.conf`) and leaves a timestamped `.bak` copy next to it; it is only
-ever run when you invoke it explicitly.
+Dependencies: `wl-clipboard`, `jq`, `wtype` (already part of Omarchy).
+Optional: `tesseract` and a language pack (`omarchy pkg add tesseract
+tesseract-data-eng`) for OCR. Without it, images simply have no text panel.
 
 ## Keys
 
 | Key | Action |
 | --- | --- |
-| `Ctrl+N` / `Ctrl+P` (or arrows) | navigate results |
-| `Enter` | copy to clipboard and paste into the focused window |
+| `↑` `↓` / `Ctrl+N` `Ctrl+P` | move |
+| `PgUp` `PgDn` / `Ctrl+Home` `Ctrl+End` | jump |
+| `←` `→` | switch category |
+| `Enter` | copy and paste into the focused window |
 | `Shift+Enter` | copy only |
-| `Ctrl+O` | open a pure link in the browser, an image in the editor, or a file externally. Text entries stay in the picker; use `Return` to paste them. QR images open their **decoded link** in the browser; the preview pane also has clickable "Open link" chips for links and QR payloads |
-| `Ctrl+Shift+C` | copy the entry's text content as plain text: for images, the OCR text (or QR payload). The QR and OCR panels also have **Copy** chips |
-| `Tab` | pin/unpin |
-| `Ctrl+=` | pause/resume recording |
-| `Delete` | remove entry · `Shift+Delete` clear all (with confirm) |
-| `Esc` | clear filter, then close |
+| `Ctrl+O` / `Alt+Enter` | open: links in the browser, images in the viewer, text in the editor |
+| `Ctrl+Shift+P` | copy the file path (images and files) |
+| `Ctrl+Shift+C` | copy as plain text; for images, the OCR text |
+| `Tab` | pin / unpin |
+| `Shift+Tab` | unpin all (confirms) |
+| `Del` | delete; does nothing on a pin |
+| `Ctrl+Del` | delete a pinned entry (confirms) |
+| `Shift+Del` | clear history, keeping pins (confirms) |
+| `Ctrl+U` | clear the search |
+| `Esc` | clear the search, then close |
 
-Pause/resume is also scriptable — useful for automation or a custom binding:
+## Data
 
-```bash
-omarchy-shell shell call alanfortlink.clipboard pause '{"paused":"toggle"}'
-omarchy-shell shell call alanfortlink.clipboard isPaused
-```
-
-## Configuration
-
-Settings live on the plugin's entry in the `plugins` array of
-`~/.config/omarchy/shell.json` and hot-reload on save:
-
-```json
-{
-  "version": 1,
-  "plugins": [
-    {
-      "id": "alanfortlink.clipboard",
-      "historyLimit": 1500,
-      "maxAgeDays": 30,
-      "maxRows": 200
-    }
-  ]
-}
-```
-
-| Key | Default | Meaning |
-|-----|---------|---------|
-| `historyLimit` | `1500` | max entries kept in history |
-| `maxAgeDays` | `0` (forever) | drop entries older than N days (images get garbage-collected; pinned entries are exempt) |
-| `maxRows` | `200` | max rows the picker shows per search |
-| `qrDecode` | `true` | decode QR codes with `zbarimg` on captured images |
-| `ocr` | `true` | OCR captured images with `tesseract` (skipped automatically if not installed) |
-| `ocrLang` | `"eng"` | tesseract language(s), e.g. `"deu"` or `"eng+deu"` — install packs with `omarchy pkg add tesseract-data-deu` |
-
-History lives in `~/.local/state/omarchy/clipboard-history-rich.json`; image
-blobs are content-addressed under `~/.local/state/omarchy/clipboard-images/`.
-
-## How it compares
-
-| | built-in `omarchy.clipboard` | [sspaeti's OCR fork](https://github.com/sspaeti/omarchy-clipboard-plugin) | [Clipbasket](https://github.com/clipbasket/clipbasket-omarchy) | vicinae | **clipboard-history** |
-|---|---|---|---|---|---|
-| Fuzzy search | substring | + OCR text | ✓ | ✓ | content + app + type + date tokens (`type:`, `app:`, `<2h`, `today`) |
-| Previews | text/image | — | — | ✓ | images, **QR payloads**, color swatches, JSON pretty-print, links, files |
-| Metadata | basic | basic | SQLite | ✓ | size, source app, dims, word/line counts, pins, paste counts |
-| OCR search | ✗ | ✓ (forked for it) | ✗ | ✗ | ✓ (`ocr`, searchable + preview panel) |
-| Retention config | 300 cap | limit | ✓ | ✓ | `historyLimit` + `maxAgeDays` + GC |
-| Pause recording | ✗ | ✗ | ? | ✓ | ✓ (in-picker + IPC) |
-| Theme-integrated shell overlay | ✓ | ✓ | ✓ | own | ✓ (uses Omarchy's theme singletons) |
-
-## Roadmap / ideas
-
-- `autoPaste` mode swap: Enter = copy-only, Shift+Enter = paste (walker-style)
-- OCR language auto-detect / confidence thresholds
-- Small bar widget: last-copied item + paused indicator
-- Snippet editing: edit a pinned entry's content in place
-- Multi-select delete, export/import of history
-- Optional per-app capture exclusions beyond the password-manager hint
+History lives in `~/.local/state/omarchy/clipboard-history.json`, the same
+file the built-in uses. Entries gain two optional fields, `pinned` and `ocr`;
+the built-in ignores both, so switching back loses nothing but the pins.
 
 ## Development
 
-```
-├── manifest.json      # plugin manifest (replaces omarchy.clipboard via clonedFrom)
-├── Clipboard.qml      # picker overlay: search, chips, list, keys, capture watchers
-├── PreviewPane.qml    # per-type preview + metadata chips
-├── Store.js           # history model: dedup, pins, retention, settings parsing
-├── Fuzzy.js           # query parser, fuzzy matcher, scoring, highlighting
-├── Classify.js        # type detection, app names, formatting, color math
-├── capture.py         # clipboard watcher → one JSON line per clip (QR + OCR)
-├── paste-entry.sh     # copy + shift-insert paste into the focused window
-├── open-entry.sh      # open with the right app
-├── tests/             # node --test suites for the JS logic
-└── scripts/           # screenshot regeneration helpers
+```bash
+git clone https://github.com/Akshad135/real-clipboard.git
+ln -sTfn "$PWD/real-clipboard" ~/.config/omarchy/plugins/akshad135.clipboard
+omarchy-shell shell rescanPlugins && omarchy plugin enable akshad135.clipboard
+tests/run.sh
 ```
 
-- Run logic tests: `tests/run.sh`
-- Validate the manifest: `omarchy plugin validate <checkout-dir>`
-- Regenerate screenshots: `scripts/take-screenshots.sh` (stages demo content
-  and captures the picker keyboard-free over IPC)
-- Hot-reload after edits: `omarchy-shell shell rescanPlugins`
+The shell caches plugin QML; after editing, `omarchy restart shell`.
 
-## License
-
-[MIT](LICENSE)
+Built on the clipboard plugin that ships with [Omarchy](https://omarchy.org). MIT.

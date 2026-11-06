@@ -1,10 +1,10 @@
-// Logic tests for clipboard/ClipboardHistory.js (the built-in clone).
+// Logic tests for ClipboardHistory.js.
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { createRequire } from "node:module"
 
 const require = createRequire(import.meta.url)
-const H = require("../clipboard/ClipboardHistory.js")
+const H = require("../ClipboardHistory.js")
 
 const text = (t, extra = {}) => ({ type: "text", text: t, ...extra })
 
