@@ -476,12 +476,19 @@ Item {
   property bool dimsAvailable: false
   // The formats capture.sh stores; anything else identify reports is not a picture.
   readonly property var imageFormats: ["PNG", "JPEG", "WEBP", "GIF", "BMP", "TIFF"]
+  // Coder forced from the extension capture.sh chose; without the prefix
+  // ImageMagick sniffs magic bytes and would hand PS/PDF/SVG bytes in a
+  // ".png" to ghostscript or librsvg before the format check ever runs.
+  readonly property var coderForExt: ({ png: "PNG", jpg: "JPEG", webp: "WEBP", gif: "GIF", bmp: "BMP", tiff: "TIFF" })
+  function coderOf(path) {
+    return root.coderForExt[String(path).slice(String(path).lastIndexOf(".") + 1)] || ""
+  }
 
   function maybeProbeDims() {
     if (!root.opened || !root.dimsAvailable || dimsProc.running) return
     var row = root.currentRow
     if (!row || row.entryType !== "image" || root.imageDims[row.path] !== undefined) return
-    if (!root.isStoredImage(row.path)) return
+    if (!root.isStoredImage(row.path) || !root.coderOf(row.path)) return
     dimsProc.path = row.path
     dimsProc.running = true
   }
@@ -566,7 +573,7 @@ Item {
     id: dimsProc
     property string path: ""
     // "[0]" selects the first frame; animated GIFs otherwise print one record per frame.
-    command: ["magick", "identify", "-ping", "-format", "%m %w %h", path + "[0]"]
+    command: ["timeout", "5s", "magick", "identify", "-ping", "-format", "%m %w %h", root.coderOf(path) + ":" + path + "[0]"]
     stdout: StdioCollector {
       id: dimsOut
       waitForEnd: true
