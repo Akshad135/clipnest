@@ -29,7 +29,11 @@ it to get the built-in back:
 omarchy plugin disable akshad135.clipboard
 ```
 
-Dependencies: `wl-clipboard`, `jq`, `wtype` (already part of Omarchy).
+Keep the built-in `omarchy.clipboard` disabled while this is enabled (the
+`--enable` above does that). Both running at once means two capture watchers
+writing the same history file.
+
+Dependencies: `wl-clipboard`, `jq`, `wtype`, `imagemagick` (already part of Omarchy).
 Optional: `tesseract` and a language pack (`omarchy pkg add tesseract
 tesseract-data-eng`) for OCR. Without it, images simply have no text panel.
 
@@ -38,7 +42,7 @@ tesseract-data-eng`) for OCR. Without it, images simply have no text panel.
 | Key | Action |
 | --- | --- |
 | `↑` `↓` / `Ctrl+N` `Ctrl+P` | move |
-| `PgUp` `PgDn` / `Ctrl+Home` `Ctrl+End` | jump |
+| `PgUp` `PgDn` / `Home` `End` | jump |
 | `←` `→` | switch category |
 | `Enter` | copy and paste into the focused window |
 | `Shift+Enter` | copy only |

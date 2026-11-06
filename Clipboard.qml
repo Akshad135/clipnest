@@ -163,7 +163,7 @@ Item {
       var at = ClipboardHistory.indexOfKey(root.history, root.confirmKey)
       if (at >= 0 && ClipboardHistory.isPinned(root.history[at]))
         root.history = ClipboardHistory.removeEntryAt(root.history, at, true)
-      root.selectedIndex = Math.max(0, root.selectedIndex - 1)
+      // rebuildDisplay clamps the cursor; the next row takes the freed slot.
     } else if (root.confirmAction === "unpinAll") {
       // Keep the cursor on the same entry after it moves out of the pin section.
       var row = root.currentRow
@@ -229,6 +229,7 @@ Item {
     var rows = ClipboardHistory.displayRows(root.history, root.filterText, 50, Commons.I18n.t, Commons.I18n.tn, Commons.I18n.formatNumber, root.category)
 
     displayModel.clear()
+    root.lastClickedIndex = -1 // rows may shift under a pending second click
     var pins = 0
     for (var i = 0; i < rows.length; i++) {
       var row = rows[i]
@@ -436,8 +437,31 @@ Item {
     }
   }
 
-  onCurrentRowChanged: Qt.callLater(root.maybeStartOcr)
-  onOpenedChanged: if (root.opened) Qt.callLater(root.maybeStartOcr)
+  // Image dimensions for the preview chip, read from the header only
+  // (identify -ping), cached per path for the session.
+  property var imageDims: ({})
+  readonly property string currentImageDims: root.currentRow && root.currentRow.entryType === "image"
+    ? String(root.imageDims[root.currentRow.path] || "") : ""
+
+  function maybeProbeDims() {
+    if (!root.opened || dimsProc.running) return
+    var row = root.currentRow
+    if (!row || row.entryType !== "image" || root.imageDims[row.path] !== undefined) return
+    dimsProc.path = row.path
+    dimsProc.running = true
+  }
+
+  function finishDims(path, text, code) {
+    var dims = {}
+    for (var key in root.imageDims) dims[key] = root.imageDims[key]
+    var parts = String(text || "").trim().split(/\s+/)
+    dims[path] = code === 0 && parts.length === 2 && Number(parts[0]) > 0 ? parts[0] + "×" + parts[1] : ""
+    root.imageDims = dims
+    Qt.callLater(root.maybeProbeDims)
+  }
+
+  onCurrentRowChanged: { Qt.callLater(root.maybeStartOcr); Qt.callLater(root.maybeProbeDims) }
+  onOpenedChanged: if (root.opened) { Qt.callLater(root.maybeStartOcr); Qt.callLater(root.maybeProbeDims) }
 
   Component.onCompleted: initProc.running = true
 
@@ -490,6 +514,17 @@ Item {
       waitForEnd: true
     }
     onExited: function(code) { root.finishOcr(root.ocrPath, ocrOut.text, code) }
+  }
+
+  Process {
+    id: dimsProc
+    property string path: ""
+    command: ["magick", "identify", "-ping", "-format", "%w %h", path]
+    stdout: StdioCollector {
+      id: dimsOut
+      waitForEnd: true
+    }
+    onExited: function(code) { root.finishDims(dimsProc.path, dimsOut.text, code) }
   }
 
   Process {
@@ -611,12 +646,11 @@ Item {
           var alt = event.modifiers & Qt.AltModifier
 
           if (event.key === Qt.Key_Escape) {
-            if (root.filterText) { filterInput.text = ""; root.setFilter("") }
+            if (root.filterText) filterInput.text = "" // onTextChanged rebuilds
             else root.close()
             event.accepted = true
           } else if (event.key === Qt.Key_U && event.modifiers === Qt.ControlModifier) {
             filterInput.text = ""
-            root.setFilter("")
             event.accepted = true
           } else if (event.key === Qt.Key_Delete) {
             if (shift) root.requestClearHistory()
@@ -647,10 +681,10 @@ Item {
           } else if (event.key === Qt.Key_PageDown) {
             root.select(6)
             event.accepted = true
-          } else if (event.key === Qt.Key_Home && ctrl) {
+          } else if (event.key === Qt.Key_Home) {
             root.selectAbsolute(0)
             event.accepted = true
-          } else if (event.key === Qt.Key_End && ctrl) {
+          } else if (event.key === Qt.Key_End) {
             root.selectAbsolute(displayModel.count - 1)
             event.accepted = true
           } else if (ctrl && event.key === Qt.Key_O) {
@@ -1015,6 +1049,7 @@ Item {
                 row: root.currentRow
                 ocrBusy: !!(ocrProc.running && root.currentRow && root.ocrPath === root.currentRow.path)
                 ocrAvailable: root.ocrAvailable
+                imageDims: root.currentImageDims
                 foreground: root.foreground
                 lineColor: root.lineColor
                 chipBg: root.chipBg

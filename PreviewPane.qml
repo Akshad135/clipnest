@@ -14,6 +14,8 @@ Item {
   property var row: null
   property bool ocrBusy: false
   property bool ocrAvailable: true
+  // "WxH" for the current image, probed by the picker; "" until known.
+  property string imageDims: ""
 
   property color foreground: "white"
   property color lineColor: "gray"
@@ -64,8 +66,7 @@ Item {
     if (!row) return []
     var out = []
     if (isImage) {
-      if (image.status === Image.Ready && image.sourceSize.width > 0)
-        out.push(image.sourceSize.width + "×" + image.sourceSize.height)
+      if (root.imageDims) out.push(root.imageDims)
       out.push(String(row.mime || "").replace(/^image\//, ""))
       if (row.capturedAt) out.push(String(row.capturedAt))
       if (hasOcr) out.push(Commons.I18n.t("clipboard.chipOcr", "%1 words of text").replace("%1", ClipboardHistory.textStats(ocrText).words))
@@ -178,15 +179,14 @@ Item {
         border.width: Style.normalBorderWidth
         border.color: root.lineColor
 
-        Image {
+        // Decoded at roughly the drawn size, never at the file's own size.
+        SizedImage {
           id: image
           anchors.fill: parent
           anchors.margins: Style.space(8)
-          source: parent.visible ? root.imageUrl : ""
-          fillMode: Image.PreserveAspectFit
+          url: parent.visible ? root.imageUrl : ""
           asynchronous: true
           smooth: true
-          mipmap: true
         }
 
         Text {
